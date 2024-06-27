@@ -32,9 +32,6 @@ Deletes cached shader files for NVIDIA, AMD, and DirectX.
 <h4>Recycle Bin</h4>
 Empties the Recycle Bin.
 
-<h4>Thumbnails Cache</h4>
-Clears thumbnail database files.
-
 <h4>Windows Error Reporting Files</h4>
 Deletes Windows Error Reporting files from various locations.
 
@@ -43,6 +40,9 @@ Clears Windows Defender scan history logs.
 
 <h4>Disk Cleanup</h4>
 Runs the built-in Disk Cleanup utility.
+
+<h4>And Much more!!</h4>
+DNS Flush, Browser Cache, Defender Logs, etc
 
 ## Storage Sense configuration
 It does not work as expected on all systems due to variations in Windows versions and configurations..
