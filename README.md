@@ -3,8 +3,10 @@
 This batch script performs a comprehensive cleanup of your Windows system, removing temporary files, caches, and other unnecessary files to free up disk space and improve system performance.
 
 ## Usage
- Just Run it ✔️
-
+ Ofc the Smartscreen will stop it!<br>
+ Click on More Info<br>
+ And Run Anyway<br><br>
+ ![image](https://github.com/5h1Vm/cleaner/assets/83861668/d1cf030f-bb68-4a11-a4e6-47736bac7234)
 ## Script Details
 <h4> Administrative Privileges</h4>
 The script first checks if it is running with administrative privileges. If not, it self-elevates using a temporary VBScript.
