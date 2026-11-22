@@ -7,7 +7,7 @@ It works on any machine. Nothing in it points at one computer: every location is
 ## Usage
 
 1. Download `cleaner.bat`.
-2. Double-click it. Use a normal double-click, not "Run as administrator": it first trims your WSL distros as your own account, then asks for admin rights for the rest.
+2. Double-click it and accept the admin prompt. Everything then runs in one admin window.
 3. Windows SmartScreen may warn you because the file came from the internet. Click **More info**, then **Run anyway**.
 
 ![SmartScreen](https://github.com/5h1Vm/cleaner/assets/83861668/d1cf030f-bb68-4a11-a4e6-47736bac7234)
@@ -76,7 +76,7 @@ The output is verbose: every file and folder it removes is listed with its size,
 WSL distros, Docker Desktop and Hyper-V store everything in `.vhdx` files. These files grow but never shrink on their own, even after you delete things inside them. The script:
 
 1. Finds every disk: WSL distros from the registry, Docker Desktop's disks from its settings and default folder, and Hyper-V VMs that are switched off and have no checkpoints.
-2. Runs `fstrim` inside each WSL distro, before asking for admin rights, so the free space can be returned.
+2. Runs `fstrim` inside each WSL distro so the free space can be returned.
 3. Stops Docker Desktop and shuts down WSL.
 4. Compacts each disk with `diskpart`, which is part of every Windows edition.
 

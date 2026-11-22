@@ -16,10 +16,8 @@ exit /b
 #  Cleaner for Windows 10 / 11
 #  https://github.com/5h1Vm/cleaner
 #
-#  Double-click cleaner.bat. It runs in two stages:
-#    1. As you: trims free space inside your WSL distros (WSL only
-#       shows your distros to your normal, non-admin account).
-#    2. As admin: everything else.
+#  Double-click cleaner.bat. It asks for admin rights once, then does
+#  everything in a single admin window.
 #
 #  Nothing here is specific to one machine. Every location is resolved
 #  at runtime: from the tool itself, its environment variables, the
@@ -37,8 +35,8 @@ $ArgText = [string]$env:CLEANER_ARGS
 # ---------------------------------------------------------------------
 #  Who are we cleaning for?
 #  When a standard user elevates with another admin account, the
-#  elevated process has the admin's profile. Stage 1 passes the
-#  original user's SID so stage 2 cleans the right profile.
+#  elevated process has the admin's profile. The elevation request
+#  passes the original user's SID so the right profile is cleaned.
 # ---------------------------------------------------------------------
 $CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $TargetSid  = $CurrentSid
@@ -63,9 +61,6 @@ if ($SameUser) {
 }
 $UserHive = "Registry::HKEY_USERS\$TargetSid"
 $IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-# Stage 1 writes its trim results here for stage 2 to show.
-$TrimResultFile = Join-Path $UserTemp 'cleaner-trim.json'
 
 # ---------------------------------------------------------------------
 #  Output
@@ -217,58 +212,19 @@ function Invoke-Trim($Distro, [bool]$DockerRunning) {
     return [pscustomobject]@{ Name = $Distro.Name; Ok = $r.Ok; ExitCode = $r.ExitCode; Output = @($r.Output) }
 }
 
-# =====================================================================
-#  Stage 1: not admin yet. Trim WSL as the normal user, then elevate.
-# =====================================================================
+# ---------------------------------------------------------------------
+#  Not admin yet: ask for admin rights once and hand over. This window
+#  closes; all the work happens in the admin window.
+# ---------------------------------------------------------------------
 if (-not $IsAdmin) {
-    Show-Banner
-    Write-Section 'Prepare'
-    $distros = @(Get-WslDistros)
-    $results = @()
-    if ($distros.Count -gt 0 -and (Test-Tool 'wsl')) {
-        $dockerRunning = $false
-        if (($distros | Where-Object { $_.Name -like 'docker-desktop*' }) -and (Test-Tool 'docker')) {
-            $dockerRunning = (Invoke-Timed 'docker' 'info' 20).Ok
-        }
-        foreach ($d in $distros) {
-            $res = $null
-            if (Test-Path -LiteralPath $d.Vhd) {
-                if ($d.Name -notlike 'docker-desktop*' -or $dockerRunning) {
-                    Start-Step "Trim free space: $($d.Name)"
-                    Write-Info "exec  wsl -d $($d.Name) -u root -e /sbin/fstrim -av"
-                    $res = Invoke-Trim $d $dockerRunning
-                    foreach ($l in $res.Output) { Write-Detail "> $l" }
-                    if ($res.Ok) { End-Step 'trimmed' } else { End-Step ('trim failed (exit {0})' -f $res.ExitCode) 'Yellow' }
-                }
-            }
-            if ($res) { $results += $res }
-        }
-    }
-    try { ConvertTo-Json -InputObject @($results) -Depth 4 | Set-Content -LiteralPath $TrimResultFile -Encoding UTF8 } catch { }
-
-    Start-Step 'Request administrator rights'
+    Write-Host '[*] Requesting administrator rights...' -ForegroundColor Green
     try {
         Start-Process -FilePath $env:CLEANER_PATH -ArgumentList ('/user:' + $CurrentSid) -Verb RunAs -ErrorAction Stop
-        End-Step 'continuing in the admin window'
         exit 10
     } catch {
-        Remove-Item -LiteralPath $TrimResultFile -Force -ErrorAction SilentlyContinue
-        End-Step 'administrator rights were not granted, nothing was cleaned' 'Red'
+        Write-Host '[x] Administrator rights were not granted. Nothing was cleaned.' -ForegroundColor Red
         exit 1
     }
-}
-
-# =====================================================================
-#  Stage 2: admin.
-# =====================================================================
-
-# Trim results from stage 1 (read now, before Temp is cleaned).
-$PreTrim = @{}
-if (Test-Path -LiteralPath $TrimResultFile) {
-    try {
-        foreach ($t in @(Get-Content -LiteralPath $TrimResultFile -Raw | ConvertFrom-Json)) { if ($t.Name) { $PreTrim[$t.Name] = $t } }
-    } catch { }
-    Remove-Item -LiteralPath $TrimResultFile -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------
@@ -780,25 +736,19 @@ End-Step ('{0} disk(s), {1} on disk' -f $disks.Count, (Format-Size $diskTotal))
 if ($disks.Count -gt 0) {
     $haveWsl = ($wslDistros.Count -gt 0) -and (Test-Tool 'wsl')
 
-    # 1. Trim. Normally done in stage 1 as the user; shown here. If stage 1
-    #    did not run (started as admin directly), try it now.
+    # 1. Trim: tell each Linux filesystem which blocks are free, so the
+    #    compaction can actually return them to Windows.
     if ($haveWsl) {
         foreach ($w in $wslDistros) {
             if (-not (Test-Path -LiteralPath $w.Vhd)) { continue }
-            $res = $PreTrim[$w.Name]
-            if ($res) {
-                Start-Step "Trim free space: $($w.Name)"
-                Write-Info 'done before elevation, as your normal account'
-            } else {
-                if ($w.Name -like 'docker-desktop*' -and -not $DockerUp) { continue }
-                Start-Step "Trim free space: $($w.Name)"
-                Write-Info "exec  wsl -d $($w.Name) -u root -e /sbin/fstrim -av"
-                $res = Invoke-Trim $w $DockerUp
-                if (-not $res) { End-Step 'skipped'; continue }
-            }
+            if ($w.Name -like 'docker-desktop*' -and -not $DockerUp) { continue }
+            Start-Step "Trim free space: $($w.Name)"
+            Write-Info "exec  wsl -d $($w.Name) -u root -e /sbin/fstrim -av"
+            $res = Invoke-Trim $w $DockerUp
+            if (-not $res) { End-Step 'skipped'; continue }
             foreach ($l in @($res.Output)) { Write-Detail "> $l" }
             if ($res.Ok) { End-Step 'trimmed' }
-            else { End-Step ('trim failed (exit {0}), compacting anyway. Double-click cleaner.bat instead of "Run as administrator" so it can trim first.' -f $res.ExitCode) 'Yellow' }
+            else { End-Step ('trim failed (exit {0}), compacting anyway' -f $res.ExitCode) 'Yellow' }
         }
     }
 
