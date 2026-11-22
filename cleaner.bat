@@ -1,43 +1,23 @@
-<# : cleaner.bat - batch launcher. The PowerShell part starts after the closing comment tag.
+<# :
 @echo off
 setlocal
 title Cleaner
 set "CLEANER_PATH=%~f0"
 set "CLEANER_ARGS=%*"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([IO.File]::ReadAllText($env:CLEANER_PATH)))"
-rem Exit code 10 means this window handed over to the elevated window.
 if "%errorlevel%"=="10" exit /b
 echo.
 pause
 exit /b
 #>
 
-# =====================================================================
-#  Cleaner for Windows 10 / 11
-#  https://github.com/5h1Vm/cleaner
-#
-#  Double-click cleaner.bat. It asks for admin rights once, then does
-#  everything in a single admin window.
-#
-#  Nothing here is specific to one machine. Every location is resolved
-#  at runtime: from the tool itself, its environment variables, the
-#  registry, or the vendor default relative to the user's profile.
-# =====================================================================
-
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
-# Protected folders (Defender, Search) raise "Access is denied" on Test-Path.
-# Treat those as "not reachable" instead of printing errors.
+
 $PSDefaultParameterValues['Test-Path:ErrorAction'] = 'SilentlyContinue'
 
 $ArgText = [string]$env:CLEANER_ARGS
 
-# ---------------------------------------------------------------------
-#  Who are we cleaning for?
-#  When a standard user elevates with another admin account, the
-#  elevated process has the admin's profile. The elevation request
-#  passes the original user's SID so the right profile is cleaned.
-# ---------------------------------------------------------------------
 $CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $TargetSid  = $CurrentSid
 if ($ArgText -match '/user:(S-[0-9-]+)') { $TargetSid = $Matches[1] }
@@ -62,11 +42,6 @@ if ($SameUser) {
 $UserHive = "Registry::HKEY_USERS\$TargetSid"
 $IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# ---------------------------------------------------------------------
-#  Output
-#    [*] section     [>] step starts     |  detail lines
-#    [i] info        [!] warning         '- [+] step result
-# ---------------------------------------------------------------------
 $script:StepNo     = 0
 $script:Timer      = $null
 $script:TotalFreed = 0
@@ -96,7 +71,6 @@ function Format-Size([double]$b) {
     return ('{0:N0} KB' -f ($b / 1KB))
 }
 
-# Shows paths inside the user's profile as ~\...
 function Short([string]$p) {
     if ($p -and $UserProfile -and $p.StartsWith($UserProfile, [StringComparison]::OrdinalIgnoreCase)) {
         return '~' + $p.Substring($UserProfile.Length)
@@ -104,13 +78,10 @@ function Short([string]$p) {
     return $p
 }
 
-# Returns the first argument that is not empty.
 function First-Set { foreach ($a in $args) { if ($a) { return $a } }; return $null }
 
 function Test-Tool([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
 
-# Runs a command quietly and returns its trimmed text output (used to ask
-# tools where their caches live).
 function Get-ToolOutput([string]$Name, [string[]]$Arguments) {
     try { return ((& $Name @Arguments 2>$null | Out-String).Trim()) } catch { return $null }
 }
@@ -134,10 +105,6 @@ function Show-Banner {
     Write-Host ''
 }
 
-# ---------------------------------------------------------------------
-#  Process helpers
-# ---------------------------------------------------------------------
-# Runs a command, prints its output, returns its exit code.
 function Invoke-Tool([string]$Name, [string[]]$Arguments) {
     Write-Info ('exec  {0} {1}' -f $Name, ($Arguments -join ' '))
     $out = @(); $code = $null
@@ -157,14 +124,13 @@ function Invoke-Tool([string]$Name, [string[]]$Arguments) {
     return $code
 }
 
-# Runs a program with a time limit and captures its output.
 function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
     $r = [pscustomobject]@{ Ok = $false; ExitCode = $null; Output = @() }
     $o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()
     try {
         $p = Start-Process -FilePath $File -ArgumentList $Arguments -NoNewWindow -PassThru `
              -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop
-        # Reading Handle keeps ExitCode available after a timed wait (PowerShell quirk).
+
         $null = $p.Handle
         if (-not $p.WaitForExit($Seconds * 1000)) {
             try { $p.Kill() } catch { }
@@ -174,7 +140,7 @@ function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
         $p.WaitForExit()
         $r.ExitCode = $p.ExitCode
         $r.Ok = ($p.ExitCode -eq 0)
-        # wsl.exe writes UTF-16 messages; strip the NULs so they read normally.
+
         $r.Output = @((Get-Content -LiteralPath $o -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $e -ErrorAction SilentlyContinue) |
                       ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
     } catch { $r.Output = @($_.Exception.Message) }
@@ -182,7 +148,6 @@ function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
     return $r
 }
 
-# WSL distros registered for the user, from the Lxss registry key.
 function Get-WslDistros {
     $list = @()
     $lxss = Join-Path $UserHive 'Software\Microsoft\Windows\CurrentVersion\Lxss'
@@ -199,23 +164,14 @@ function Get-WslDistros {
     return $list
 }
 
-# Tells a distro's filesystem which blocks are free, so compaction can
-# return them to Windows. docker-desktop is only trimmed while Docker runs.
 function Invoke-Trim($Distro, [bool]$DockerRunning) {
-    if (-not (Test-Path -LiteralPath $Distro.Vhd)) { return $null }   # WSL 1 distro, no disk
+    if (-not (Test-Path -LiteralPath $Distro.Vhd)) { return $null }
     if ($Distro.Name -like 'docker-desktop*' -and -not $DockerRunning) { return $null }
-    # No quotes around the name: wsl.exe keeps them as part of the name when
-    # started this way. Distro names cannot contain spaces, so none are needed.
-    # Full path because "wsl -e" does not search sbin. /sbin/fstrim resolves on
-    # Debian, Ubuntu, Kali, Fedora, Arch and Alpine alike.
+
     $r = Invoke-Timed 'wsl.exe' "-d $($Distro.Name) -u root -e /sbin/fstrim -av" 180
     return [pscustomobject]@{ Name = $Distro.Name; Ok = $r.Ok; ExitCode = $r.ExitCode; Output = @($r.Output) }
 }
 
-# ---------------------------------------------------------------------
-#  Not admin yet: ask for admin rights once and hand over. This window
-#  closes; all the work happens in the admin window.
-# ---------------------------------------------------------------------
 if (-not $IsAdmin) {
     Write-Host '[*] Requesting administrator rights...' -ForegroundColor Green
     try {
@@ -227,9 +183,6 @@ if (-not $IsAdmin) {
     }
 }
 
-# ---------------------------------------------------------------------
-#  File helpers
-# ---------------------------------------------------------------------
 function Get-EntrySize($Item) {
     try {
         if ($Item -is [IO.FileInfo]) { return [double]$Item.Length }
@@ -250,8 +203,6 @@ function Get-FolderSize([string[]]$Folders) {
     return [double]$t
 }
 
-# Deletes one file or folder. Folders go through "rd /s /q", which removes
-# junctions and symlinks without following them into their targets.
 function Remove-Entry([IO.FileSystemInfo]$Item) {
     try {
         if ($Item -is [IO.DirectoryInfo]) {
@@ -268,8 +219,6 @@ function Remove-Entry([IO.FileSystemInfo]$Item) {
     return -not (Test-Path -LiteralPath $Item.FullName)
 }
 
-# Removes everything matching each path pattern, e.g. "C:\x\*" or "C:\x\*.db",
-# and prints every entry. Locked or protected entries are reported and kept.
 function Remove-Items([string]$Label, [string[]]$Paths) {
     $Paths = @($Paths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($Paths.Count -eq 0) { return }
@@ -298,8 +247,6 @@ function Remove-Items([string]$Label, [string[]]$Paths) {
     End-Step $msg $(if ($busy) { 'Yellow' } else { 'Green' })
 }
 
-# Clears the contents of each folder that exists (not the folder itself).
-# Folders that do not exist on this machine are skipped silently.
 function Clear-Folder([string]$Label, [string[]]$Folders) {
     $paths = @()
     foreach ($f in $Folders) {
@@ -308,9 +255,6 @@ function Clear-Folder([string]$Label, [string[]]$Folders) {
     Remove-Items $Label $paths
 }
 
-# A developer cache: use the tool's own clean command when it is installed
-# for this user, otherwise delete the cache folder the tool reports or the
-# vendor's default folder.
 function Clear-DevCache {
     param([string]$Label, [string]$Tool, [string[]]$CleanArgs, [string[]]$Folders)
     $Folders = @($Folders | Where-Object { $_ })
@@ -331,7 +275,6 @@ function Clear-DevCache {
     Clear-Folder $Label $Folders
 }
 
-# y/N question that gives up after $Seconds with no key press.
 function Read-YesNo([string]$Question, [int]$Seconds) {
     try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } }
     catch { Write-Warn "$Question  (no keyboard available, skipped)"; return $false }
@@ -361,9 +304,6 @@ function Get-FreeSpace {
     return $r
 }
 
-# ---------------------------------------------------------------------
-#  Start
-# ---------------------------------------------------------------------
 Show-Banner
 $RunTimer = [Diagnostics.Stopwatch]::StartNew()
 
@@ -377,8 +317,6 @@ Write-Host ('[*] drives  : {0}' -f (($FreeBefore.Keys | ForEach-Object { "$_ $(F
 Write-Host '[!] close your browsers and apps for the best result' -ForegroundColor Yellow
 Write-Host '[!] WSL and Docker Desktop will be shut down to compact their disks' -ForegroundColor Yellow
 
-# Optional log file, saved next to cleaner.bat (or in the user's profile
-# if that folder is read-only). No answer in 30 s means no log.
 $LogFile = $null
 Write-Section 'Log'
 Start-Step 'Log file'
@@ -398,17 +336,15 @@ if (Read-YesNo 'Save a log file of this run?' 30) {
     End-Step 'no log'
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'Temporary files'
-# ---------------------------------------------------------------------
+
 $tempDirs = @($UserTemp, (Join-Path $env:WINDIR 'Temp')) | Where-Object { $_ } |
             ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Select-Object -Unique
 Clear-Folder 'Temp folders' $tempDirs
 Clear-Folder 'Prefetch' @(Join-Path $env:WINDIR 'Prefetch')
 
-# ---------------------------------------------------------------------
 Write-Section 'Windows Update'
-# ---------------------------------------------------------------------
+
 $wuServices = 'wuauserv', 'bits'
 Start-Step 'Stop update services'
 foreach ($s in $wuServices) { Write-Info "stop  $s" }
@@ -434,11 +370,8 @@ if (Test-Tool 'Delete-DeliveryOptimizationCache') {
     Clear-Folder 'Delivery Optimization cache' @($doCache)
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'Browser caches'
-# ---------------------------------------------------------------------
-# Chromium browsers keep every profile under "User Data". Profiles are
-# found by looking for their Preferences file, not by assuming "Default".
+
 $chromium = [ordered]@{
     'Edge'     = 'Microsoft\Edge'
     'Chrome'   = 'Google\Chrome'
@@ -465,11 +398,11 @@ foreach ($name in $chromium.Keys) {
     }
     Remove-Items "$name cache" $paths
 }
-# Opera keeps a flat layout per edition (Opera Stable, Opera GX Stable, ...).
+
 Get-ChildItem -LiteralPath (Join-Path $Local 'Opera Software') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     Clear-Folder "$($_.Name) cache" @((Join-Path $_.FullName 'Cache'), (Join-Path $_.FullName 'GPUCache'))
 }
-# Firefox and its forks keep the cache in the Local profile folder.
+
 foreach ($ff in 'Mozilla\Firefox', 'Waterfox', 'LibreWolf', 'Floorp', 'zen') {
     $profiles = Join-Path $Local (Join-Path $ff 'Profiles')
     Get-ChildItem -LiteralPath $profiles -Directory -ErrorAction SilentlyContinue | ForEach-Object {
@@ -477,17 +410,15 @@ foreach ($ff in 'Mozilla\Firefox', 'Waterfox', 'LibreWolf', 'Floorp', 'zen') {
     }
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'GPU and shader caches'
-# ---------------------------------------------------------------------
+
 Clear-Folder 'DirectX shader cache' @(Join-Path $Local 'D3DSCache')
 Clear-Folder 'NVIDIA shader cache'  @((Join-Path $Local 'NVIDIA\DXCache'), (Join-Path $Local 'NVIDIA\GLCache'), (Join-Path $Local 'NVIDIA Corporation\NV_Cache'))
 Clear-Folder 'AMD shader cache'     @((Join-Path $Local 'AMD\DXCache'), (Join-Path $Local 'AMD\GLCache'), (Join-Path $Local 'AMD\VkCache'), (Join-Path $Local 'AMD\DxcCache'))
 Clear-Folder 'Intel shader cache'   @(Join-Path $Local 'Intel\ShaderCache')
 
-# ---------------------------------------------------------------------
 Write-Section 'Windows caches and logs'
-# ---------------------------------------------------------------------
+
 $explorer = Join-Path $Local 'Microsoft\Windows\Explorer'
 Remove-Items 'Thumbnail cache' @(Join-Path $explorer 'thumbcache_*.db')
 Remove-Items 'Icon cache'      @(Join-Path $explorer 'iconcache_*.db')
@@ -523,9 +454,8 @@ Clear-Folder 'Windows shell cache' @(Join-Path $Local 'Microsoft\Windows\Caches'
 Clear-Folder 'Search index logs'   @(Join-Path $env:ProgramData 'Microsoft\Search\Data\Applications\Windows\GatherLogs')
 Clear-Folder '.NET usage logs'     @((Join-Path $Local 'Microsoft\CLR_v2.0\UsageLogs'), (Join-Path $Local 'Microsoft\CLR_v4.0\UsageLogs'), (Join-Path $Local 'Microsoft\CLR_v4.0_32\UsageLogs'))
 
-# ---------------------------------------------------------------------
 Write-Section 'App caches'
-# ---------------------------------------------------------------------
+
 $teamsClassic = Join-Path $Roaming 'Microsoft\Teams'
 Clear-Folder 'Teams (classic) cache' @((Join-Path $teamsClassic 'Cache'), (Join-Path $teamsClassic 'blob_storage'), (Join-Path $teamsClassic 'GPUCache'), (Join-Path $teamsClassic 'tmp'))
 Get-ChildItem -LiteralPath (Join-Path $Local 'Packages') -Directory -Filter 'MSTeams_*' -ErrorAction SilentlyContinue | ForEach-Object {
@@ -534,15 +464,13 @@ Get-ChildItem -LiteralPath (Join-Path $Local 'Packages') -Directory -Filter 'MST
 $oneDrive = Join-Path $Local 'Microsoft\OneDrive'
 Clear-Folder 'OneDrive logs' @((Join-Path $oneDrive 'logs'), (Join-Path $oneDrive 'setup\logs'))
 
-# VS Code and its forks.
 $editors = 'Code', 'Code - Insiders', 'VSCodium', 'Cursor', 'Windsurf'
 foreach ($ed in $editors) {
     $root = Join-Path $Roaming $ed
     if (-not (Test-Path -LiteralPath $root)) { continue }
     Clear-Folder "$ed cache" @((Join-Path $root 'Cache'), (Join-Path $root 'CachedData'), (Join-Path $root 'Code Cache'), (Join-Path $root 'GPUCache'), (Join-Path $root 'CachedExtensionVSIXs'))
 }
-# Any other Electron app (Discord, Slack, Spotify, ...). They are found by
-# their "Local Storage" folder, then only their cache folders are cleared.
+
 Get-ChildItem -LiteralPath $Roaming -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     $app = $_.FullName
     if ($editors -contains $_.Name) { return }
@@ -555,12 +483,7 @@ Get-ChildItem -LiteralPath $Roaming -Directory -ErrorAction SilentlyContinue | F
     Remove-Items "$($_.Name) cache" $paths
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'Developer caches'
-# ---------------------------------------------------------------------
-# Each entry asks the tool where its cache lives, then the tool's
-# environment variable, then the vendor default. A tool's own clean
-# command is used whenever it is installed.
 
 $npmCache = $null
 if ($SameUser -and (Test-Tool 'npm')) { $npmCache = Get-ToolOutput 'npm' @('config', 'get', 'cache') }
@@ -571,7 +494,6 @@ $yarnCache = $null
 if ($SameUser -and (Test-Tool 'yarn')) { $yarnCache = Get-ToolOutput 'yarn' @('cache', 'dir') }
 Clear-DevCache 'Yarn cache' 'yarn' @('cache', 'clean') @((First-Set $yarnCache $env:YARN_CACHE_FOLDER (Join-Path $Local 'Yarn\Cache')))
 
-# pnpm: only prune packages no project uses. The store itself is never deleted.
 if ($SameUser -and (Test-Tool 'pnpm')) { Clear-DevCache 'pnpm store (unused packages)' 'pnpm' @('store', 'prune') @() }
 
 Clear-DevCache 'Bun cache' 'bun' @('pm', 'cache', 'rm') @(
@@ -579,7 +501,6 @@ Clear-DevCache 'Bun cache' 'bun' @('pm', 'cache', 'rm') @(
 
 Clear-Folder 'Deno npm cache' @(Join-Path (First-Set $env:DENO_DIR (Join-Path $Local 'deno')) 'npm')
 
-# pip: every Python install shares one cache folder, so ask any pip for it.
 $pipCache = $null
 if ($SameUser) {
     $pipCandidates = @(
@@ -606,9 +527,6 @@ Clear-Folder 'Pipenv cache' @((First-Set $env:PIPENV_CACHE_DIR (Join-Path $Local
 
 if ($SameUser -and (Test-Tool 'conda')) { Clear-DevCache 'Conda packages and tarballs' 'conda' @('clean', '--all', '--yes') @() }
 
-# NuGet: clear the download and temp caches, keep global-packages so
-# projects do not need a full restore. "dotnet nuget" only exists when a
-# .NET SDK is installed (the runtime alone does not have it).
 $nugetHttp    = First-Set $env:NUGET_HTTP_CACHE_PATH (Join-Path $Local 'NuGet\v3-cache')
 $nugetPlugins = First-Set $env:NUGET_PLUGINS_CACHE_PATH (Join-Path $Local 'NuGet\plugins-cache')
 $hasDotnetSdk = $SameUser -and (Test-Tool 'dotnet') -and [bool](Get-ToolOutput 'dotnet' @('--list-sdks'))
@@ -625,7 +543,6 @@ $goCache = $null
 if ($SameUser -and (Test-Tool 'go')) { $goCache = Get-ToolOutput 'go' @('env', 'GOCACHE') }
 Clear-DevCache 'Go build cache' 'go' @('clean', '-cache') @((First-Set $goCache $env:GOCACHE (Join-Path $Local 'go-build')))
 
-# Cargo: downloaded .crate archives only. Extracted sources stay.
 Clear-Folder 'Cargo download cache' @(Join-Path (First-Set $env:CARGO_HOME (Join-Path $UserProfile '.cargo')) 'registry\cache')
 
 Clear-Folder 'Gradle build cache' @(Join-Path (First-Set $env:GRADLE_USER_HOME (Join-Path $UserProfile '.gradle')) 'caches\build-cache-1')
@@ -639,8 +556,6 @@ Clear-DevCache 'Scoop download cache' 'scoop' @('cache', 'rm', '*') @(Join-Path 
 $chocoRoot = First-Set $env:ChocolateyInstall (Join-Path $env:ProgramData 'chocolatey')
 Clear-Folder 'Chocolatey leftovers' @((Join-Path $UserTemp 'chocolatey'), (Join-Path $chocoRoot 'lib-bad'), (Join-Path $chocoRoot 'lib-bkp'))
 
-# winget has no cache command. Its installers download to Temp (cleaned
-# above); its logs live in the App Installer package folder.
 Get-ChildItem -LiteralPath (Join-Path $Local 'Packages') -Directory -Filter 'Microsoft.DesktopAppInstaller_*' -ErrorAction SilentlyContinue | ForEach-Object {
     Clear-Folder 'winget logs' @(Join-Path $_.FullName 'LocalState\DiagOutputDir')
 }
@@ -649,11 +564,8 @@ Clear-Folder 'Electron download cache'         @((First-Set $env:ELECTRON_CACHE 
 Clear-Folder 'electron-builder download cache' @((First-Set $env:ELECTRON_BUILDER_CACHE (Join-Path $Local 'electron-builder\Cache')))
 Clear-Folder 'node-gyp headers cache'          @(Join-Path $Local 'node-gyp\Cache')
 
-# ---------------------------------------------------------------------
 Write-Section 'Docker'
-# ---------------------------------------------------------------------
-# Only asked when the Docker engine is already running. If it is not
-# running there is nothing to prune, so the step is skipped.
+
 $DockerUp = $false
 if (Test-Tool 'docker') {
     Start-Step 'Unused images and build cache'
@@ -670,13 +582,8 @@ if (Test-Tool 'docker') {
     }
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'Virtual disks'
-# ---------------------------------------------------------------------
-# Disks are found, not assumed:
-#   - WSL distros from the user's Lxss registry key
-#   - Docker Desktop disks from its settings file (custom folder) and its default folder
-#   - Hyper-V VMs that are switched off and have no checkpoints
+
 $disks = New-Object System.Collections.Generic.List[object]
 function Add-Disk([string]$Path, [string]$Source) {
     if (-not $Path) { return }
@@ -705,7 +612,7 @@ foreach ($f in 'settings-store.json', 'settings.json') {
         }
     } catch { }
 }
-$dockerDirs += (Join-Path $env:ProgramData 'DockerDesktop\vm-data')   # older Hyper-V backend
+$dockerDirs += (Join-Path $env:ProgramData 'DockerDesktop\vm-data')
 foreach ($dir in ($dockerDirs | Select-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $dir)) { continue }
     Get-ChildItem -LiteralPath $dir -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
@@ -736,8 +643,6 @@ End-Step ('{0} disk(s), {1} on disk' -f $disks.Count, (Format-Size $diskTotal))
 if ($disks.Count -gt 0) {
     $haveWsl = ($wslDistros.Count -gt 0) -and (Test-Tool 'wsl')
 
-    # 1. Trim: tell each Linux filesystem which blocks are free, so the
-    #    compaction can actually return them to Windows.
     if ($haveWsl) {
         foreach ($w in $wslDistros) {
             if (-not (Test-Path -LiteralPath $w.Vhd)) { continue }
@@ -752,7 +657,6 @@ if ($disks.Count -gt 0) {
         }
     }
 
-    # 2. Release the disks.
     $dockerProcs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'Docker Desktop' -or $_.ProcessName -like 'com.docker.*' })
     if ($dockerProcs.Count -gt 0) {
         Start-Step 'Stop Docker Desktop'
@@ -770,7 +674,6 @@ if ($disks.Count -gt 0) {
         End-Step 'WSL is down'
     }
 
-    # 3. Compact with diskpart, which ships with every Windows edition.
     $saved = 0
     foreach ($d in $disks) {
         $before = (Get-Item -LiteralPath $d.Path).Length
@@ -789,7 +692,7 @@ if ($disks.Count -gt 0) {
             $null = & diskpart.exe /s $dp
             Remove-Item -LiteralPath $dp -Force -ErrorAction SilentlyContinue
         }
-        # Keep diskpart's result lines, drop its banner and progress noise.
+
         $out | ForEach-Object { "$_".Trim() } |
             Where-Object { $_ -and $_ -notmatch 'DiskPart version|Copyright|On computer|percent completed' } |
             ForEach-Object { Write-Detail "> $_" }
@@ -806,13 +709,8 @@ if ($disks.Count -gt 0) {
     if ($dockerProcs.Count -gt 0) { Write-Host '[!] Docker Desktop was stopped. Start it again when you need it.' -ForegroundColor Yellow }
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'System cleanup'
-# ---------------------------------------------------------------------
-# Previous Windows installation, left behind by feature updates. Found on
-# the system drive; skipped when it does not exist. Windows locks it, so
-# ownership goes to the built-in Administrators group first. The group is
-# named by its well-known SID, which is the same on every Windows language.
+
 $winOld = Join-Path $env:SystemDrive 'Windows.old'
 if ((Test-Path -LiteralPath $winOld) -and -not ([IO.Path]::GetFullPath($env:WINDIR).StartsWith([IO.Path]::GetFullPath($winOld), [StringComparison]::OrdinalIgnoreCase))) {
     Start-Step 'Previous Windows installation (Windows.old)'
@@ -854,13 +752,6 @@ Write-Info 'exec  ipconfig /flushdns'
 $null = & ipconfig.exe /flushdns
 End-Step 'flushed'
 
-# Storage Sense keeps cleaning between runs. It is turned on for the user
-# being cleaned (their own registry hive, found by SID), with:
-#   - temporary files cleanup on
-#   - Recycle Bin cleanup after 60 days, the longest option Windows offers
-#     (Settings > System > Storage > Storage Sense lists 1, 14, 30, 60 days)
-# Downloads cleanup and the run schedule are left as the user set them.
-# The value names below are Windows' own Storage Sense settings.
 Start-Step 'Storage Sense settings'
 $ssPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense'
 $ssPolicy    = Get-ItemProperty -Path $ssPolicyKey -ErrorAction SilentlyContinue
@@ -899,22 +790,14 @@ Write-Info 'exec  scheduled task \Microsoft\Windows\DiskFootprint\StorageSense'
 try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; End-Step 'triggered' }
 catch { End-Step 'not available on this system' 'Yellow' }
 
-# /ResetBase removes the old copies of updated Windows components. It frees
-# more space than a plain cleanup, but installed updates can no longer be
-# uninstalled afterwards.
 Start-Step 'Windows component store (can take several minutes)'
 Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup /ResetBase'
 Write-Info 'after this, installed Windows updates can no longer be uninstalled'
 & dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet
 End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
 
-# ---------------------------------------------------------------------
 Write-Section 'SSD TRIM'
-# ---------------------------------------------------------------------
-# Runs last, after everything above has freed space. Every fixed drive
-# with a letter is checked; TRIM is sent only to drives on an SSD. Drives
-# whose type Windows cannot tell (some VMs, RAID) are tried as well, and
-# drives that do not support TRIM simply report so.
+
 if (Test-Tool 'Optimize-Volume') {
     $volumes = @(Get-Volume -ErrorAction SilentlyContinue |
                  Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter -and $_.FileSystem -in 'NTFS', 'ReFS' } |
@@ -942,9 +825,8 @@ if (Test-Tool 'Optimize-Volume') {
     }
 }
 
-# ---------------------------------------------------------------------
 Write-Section 'Summary'
-# ---------------------------------------------------------------------
+
 $FreeAfter = Get-FreeSpace
 foreach ($k in $FreeAfter.Keys) {
     $b = $FreeBefore[$k]; $a = $FreeAfter[$k]
