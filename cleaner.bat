@@ -859,6 +859,30 @@ if ($disks.Count -gt 0) {
 # ---------------------------------------------------------------------
 Write-Section 'System cleanup'
 # ---------------------------------------------------------------------
+# Previous Windows installation, left behind by feature updates. Found on
+# the system drive; skipped when it does not exist. Windows locks it, so
+# ownership goes to the built-in Administrators group first. The group is
+# named by its well-known SID, which is the same on every Windows language.
+$winOld = Join-Path $env:SystemDrive 'Windows.old'
+if ((Test-Path -LiteralPath $winOld) -and -not ([IO.Path]::GetFullPath($env:WINDIR).StartsWith([IO.Path]::GetFullPath($winOld), [StringComparison]::OrdinalIgnoreCase))) {
+    Start-Step 'Previous Windows installation (Windows.old)'
+    Write-Info "found $winOld"
+    Write-Info 'after this, you cannot roll back to the previous Windows version'
+    $before = Get-FolderSize @($winOld)
+    Write-Info "size  $(Format-Size $before)"
+    Write-Info 'exec  takeown /F <folder> /R /A /D Y'
+    $null = & takeown.exe /F $winOld /R /A /D Y 2>&1
+    Write-Info 'exec  icacls <folder> /grant *S-1-5-32-544:F /T /C /Q'
+    $null = & icacls.exe $winOld /grant '*S-1-5-32-544:F' /T /C /Q 2>&1
+    Write-Info 'exec  rd /s /q <folder>'
+    & cmd.exe /d /c "rd /s /q `"$winOld`"" 2>$null
+    $left = Get-FolderSize @($winOld)
+    $freed = [Math]::Max(0, $before - $left)
+    $script:TotalFreed += $freed
+    if (Test-Path -LiteralPath $winOld) { End-Step ("partly removed | {0} freed | {1} left (in use)" -f (Format-Size $freed), (Format-Size $left)) 'Yellow' }
+    else { End-Step "removed | $(Format-Size $freed) freed" }
+}
+
 Start-Step 'Recycle Bin (all drives)'
 Write-Info 'exec  Clear-RecycleBin -Force'
 Clear-RecycleBin -Force -ErrorAction SilentlyContinue
@@ -933,6 +957,40 @@ Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup /ResetBase'
 Write-Info 'after this, installed Windows updates can no longer be uninstalled'
 & dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet
 End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
+
+# ---------------------------------------------------------------------
+Write-Section 'SSD TRIM'
+# ---------------------------------------------------------------------
+# Runs last, after everything above has freed space. Every fixed drive
+# with a letter is checked; TRIM is sent only to drives on an SSD. Drives
+# whose type Windows cannot tell (some VMs, RAID) are tried as well, and
+# drives that do not support TRIM simply report so.
+if (Test-Tool 'Optimize-Volume') {
+    $volumes = @(Get-Volume -ErrorAction SilentlyContinue |
+                 Where-Object { $_.DriveType -eq 'Fixed' -and $_.DriveLetter -and $_.FileSystem -in 'NTFS', 'ReFS' } |
+                 Sort-Object DriveLetter)
+    foreach ($v in $volumes) {
+        $letter = [string]$v.DriveLetter
+        $media = 'Unspecified'
+        try {
+            $diskNo = (Get-Partition -DriveLetter $letter -ErrorAction Stop | Select-Object -First 1).DiskNumber
+            $pd = Get-PhysicalDisk -ErrorAction Stop | Where-Object { [string]$_.DeviceId -eq [string]$diskNo } | Select-Object -First 1
+            if ($pd) { $media = [string]$pd.MediaType }
+        } catch { }
+        if ($media -eq 'HDD') { continue }
+        Start-Step "TRIM ${letter}:"
+        Write-Info ('drive {0}: {1}, {2}' -f $letter, $media, $v.FileSystem)
+        Write-Info "exec  Optimize-Volume -DriveLetter $letter -ReTrim"
+        try {
+            $msgs = @(Optimize-Volume -DriveLetter $letter -ReTrim -Verbose -ErrorAction Stop 4>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+            foreach ($m in ($msgs | Select-Object -Last 3)) { Write-Detail "> $m" }
+            End-Step 'trimmed'
+        } catch {
+            Write-Detail "> $($_.Exception.Message)"
+            End-Step 'TRIM not supported on this drive' 'Yellow'
+        }
+    }
+}
 
 # ---------------------------------------------------------------------
 Write-Section 'Summary'

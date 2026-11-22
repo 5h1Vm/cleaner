@@ -83,12 +83,16 @@ WSL distros, Docker Desktop and Hyper-V store everything in `.vhdx` files. These
 Docker Desktop is left stopped afterwards. Start it again when you need it.
 
 **System**
+- Removes the previous Windows installation (`Windows.old`) if one exists. It is often 10 to 30 GB after a feature update.
 - Empties the Recycle Bin
 - Clears all event logs
 - Flushes the DNS cache
 - Turns on Storage Sense so Windows keeps cleaning between runs: temporary files on, Recycle Bin items deleted after 60 days (the longest option Windows offers). Downloads cleanup and the schedule are left as you set them. If your PC is managed and a policy controls Storage Sense, it is left alone.
 - Runs Storage Sense once
 - Runs `DISM /StartComponentCleanup /ResetBase` to remove old copies of updated Windows components
+
+**SSD TRIM**
+- Last of all, sends TRIM to every fixed drive on an SSD, so the drives know which blocks are now free and stay fast. Hard drives are skipped.
 
 ## Things to know
 
@@ -97,6 +101,7 @@ Docker Desktop is left stopped afterwards. Start it again when you need it.
 - Jump lists are cleared, including files pinned in taskbar right-click menus.
 - The Recycle Bin is emptied without asking.
 - After the DISM `/ResetBase` step, installed Windows updates can no longer be uninstalled.
+- Once `Windows.old` is removed, you cannot roll back to the previous Windows version.
 - Storage Sense settings are changed for your account and stay that way after the script ends. You can change them in Settings > System > Storage.
 - If you sign in to the admin prompt with a different account, the script still cleans your profile, not the admin's. Developer tool commands only run for your own account; for another account it removes their cache folders instead.
 
