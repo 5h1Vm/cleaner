@@ -4,13 +4,9 @@ setlocal
 title Cleaner
 set "CLEANER_PATH=%~f0"
 set "CLEANER_ARGS=%*"
-if defined CLEANER_DRYRUN goto run
-fltmc >nul 2>&1 && goto run
-echo [*] Requesting administrator rights...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; try { Start-Process -FilePath $env:CLEANER_PATH -ArgumentList ('/user:' + $s) -Verb RunAs -ErrorAction Stop } catch { Write-Host '[x] Administrator rights were not granted. Nothing was cleaned.' -ForegroundColor Red; Start-Sleep -Seconds 5 }"
-exit /b
-:run
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([IO.File]::ReadAllText($env:CLEANER_PATH)))"
+rem Exit code 10 means this window handed over to the elevated window.
+if "%errorlevel%"=="10" exit /b
 echo.
 pause
 exit /b
@@ -20,7 +16,10 @@ exit /b
 #  Cleaner for Windows 10 / 11
 #  https://github.com/5h1Vm/cleaner
 #
-#  Double-click cleaner.bat. It asks for admin rights, then runs below.
+#  Double-click cleaner.bat. It runs in two stages:
+#    1. As you: trims free space inside your WSL distros (WSL only
+#       shows your distros to your normal, non-admin account).
+#    2. As admin: everything else.
 #
 #  Nothing here is specific to one machine. Every location is resolved
 #  at runtime: from the tool itself, its environment variables, the
@@ -33,15 +32,13 @@ $ProgressPreference    = 'SilentlyContinue'
 # Treat those as "not reachable" instead of printing errors.
 $PSDefaultParameterValues['Test-Path:ErrorAction'] = 'SilentlyContinue'
 
-# For testing only: set CLEANER_DRYRUN=1 to list what would be removed.
-$DryRun  = [bool]$env:CLEANER_DRYRUN
 $ArgText = [string]$env:CLEANER_ARGS
 
 # ---------------------------------------------------------------------
 #  Who are we cleaning for?
 #  When a standard user elevates with another admin account, the
-#  elevated process has the admin's profile. The launcher passes the
-#  original user's SID so we clean the right profile.
+#  elevated process has the admin's profile. Stage 1 passes the
+#  original user's SID so stage 2 cleans the right profile.
 # ---------------------------------------------------------------------
 $CurrentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $TargetSid  = $CurrentSid
@@ -66,6 +63,9 @@ if ($SameUser) {
 }
 $UserHive = "Registry::HKEY_USERS\$TargetSid"
 $IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# Stage 1 writes its trim results here for stage 2 to show.
+$TrimResultFile = Join-Path $UserTemp 'cleaner-trim.json'
 
 # ---------------------------------------------------------------------
 #  Output
@@ -118,6 +118,157 @@ function Test-Tool([string]$Name) { return [bool](Get-Command $Name -ErrorAction
 # tools where their caches live).
 function Get-ToolOutput([string]$Name, [string[]]$Arguments) {
     try { return ((& $Name @Arguments 2>$null | Out-String).Trim()) } catch { return $null }
+}
+
+function Show-Banner {
+    try {
+        $Host.UI.RawUI.WindowTitle     = 'Cleaner'
+        $Host.UI.RawUI.BackgroundColor = 'Black'
+        $Host.UI.RawUI.ForegroundColor = 'Green'
+        Clear-Host
+    } catch { }
+    $banner = @(
+        '   ________    _________    _   ____________ '
+        '  / ____/ /   / ____/   |  / | / / ____/ __ \'
+        ' / /   / /   / __/ / /| | /  |/ / __/ / /_/ /'
+        '/ /___/ /___/ /___/ ___ |/ /|  / /___/ _, _/ '
+        '\____/_____/_____/_/  |_/_/ |_/_____/_/ |_|  '
+    )
+    Write-Host ''
+    foreach ($l in $banner) { Write-Host "  $l" -ForegroundColor Green }
+    Write-Host ''
+}
+
+# ---------------------------------------------------------------------
+#  Process helpers
+# ---------------------------------------------------------------------
+# Runs a command, prints its output, returns its exit code.
+function Invoke-Tool([string]$Name, [string[]]$Arguments) {
+    Write-Info ('exec  {0} {1}' -f $Name, ($Arguments -join ' '))
+    $out = @(); $code = $null
+    try {
+        $out  = @(& $Name @Arguments 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } catch { $out = @($_.Exception.Message); $code = 1 }
+    if ($null -eq $code) { $code = 0 }
+    $lines = @($out | Where-Object { $_.Trim() -and $_ -ne 'System.Management.Automation.RemoteException' })
+    if ($lines.Count -le 12) {
+        foreach ($l in $lines) { Write-Detail "> $l" }
+    } else {
+        foreach ($l in ($lines | Select-Object -First 8)) { Write-Detail "> $l" }
+        Write-Detail ("> ... {0} more lines ..." -f ($lines.Count - 11))
+        foreach ($l in ($lines | Select-Object -Last 3)) { Write-Detail "> $l" }
+    }
+    return $code
+}
+
+# Runs a program with a time limit and captures its output.
+function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
+    $r = [pscustomobject]@{ Ok = $false; ExitCode = $null; Output = @() }
+    $o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()
+    try {
+        $p = Start-Process -FilePath $File -ArgumentList $Arguments -NoNewWindow -PassThru `
+             -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop
+        # Reading Handle keeps ExitCode available after a timed wait (PowerShell quirk).
+        $null = $p.Handle
+        if (-not $p.WaitForExit($Seconds * 1000)) {
+            try { $p.Kill() } catch { }
+            $r.Output = @("timed out after $Seconds s")
+            return $r
+        }
+        $p.WaitForExit()
+        $r.ExitCode = $p.ExitCode
+        $r.Ok = ($p.ExitCode -eq 0)
+        # wsl.exe writes UTF-16 messages; strip the NULs so they read normally.
+        $r.Output = @((Get-Content -LiteralPath $o -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $e -ErrorAction SilentlyContinue) |
+                      ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
+    } catch { $r.Output = @($_.Exception.Message) }
+    finally { Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue }
+    return $r
+}
+
+# WSL distros registered for the user, from the Lxss registry key.
+function Get-WslDistros {
+    $list = @()
+    $lxss = Join-Path $UserHive 'Software\Microsoft\Windows\CurrentVersion\Lxss'
+    if (-not (Test-Path $lxss)) { return $list }
+    Get-ChildItem $lxss -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+        if (-not $p.BasePath) { return }
+        $vhdName = if ($p.VhdFileName) { $p.VhdFileName } else { 'ext4.vhdx' }
+        $list += [pscustomobject]@{
+            Name = $p.DistributionName
+            Vhd  = (Join-Path ($p.BasePath -replace '^\\\\\?\\', '') $vhdName)
+        }
+    }
+    return $list
+}
+
+# Tells a distro's filesystem which blocks are free, so compaction can
+# return them to Windows. docker-desktop is only trimmed while Docker runs.
+function Invoke-Trim($Distro, [bool]$DockerRunning) {
+    if (-not (Test-Path -LiteralPath $Distro.Vhd)) { return $null }   # WSL 1 distro, no disk
+    if ($Distro.Name -like 'docker-desktop*' -and -not $DockerRunning) { return $null }
+    # No quotes around the name: wsl.exe keeps them as part of the name when
+    # started this way. Distro names cannot contain spaces, so none are needed.
+    # Full path because "wsl -e" does not search sbin. /sbin/fstrim resolves on
+    # Debian, Ubuntu, Kali, Fedora, Arch and Alpine alike.
+    $r = Invoke-Timed 'wsl.exe' "-d $($Distro.Name) -u root -e /sbin/fstrim -av" 180
+    return [pscustomobject]@{ Name = $Distro.Name; Ok = $r.Ok; ExitCode = $r.ExitCode; Output = @($r.Output) }
+}
+
+# =====================================================================
+#  Stage 1: not admin yet. Trim WSL as the normal user, then elevate.
+# =====================================================================
+if (-not $IsAdmin) {
+    Show-Banner
+    Write-Section 'Prepare'
+    $distros = @(Get-WslDistros)
+    $results = @()
+    if ($distros.Count -gt 0 -and (Test-Tool 'wsl')) {
+        $dockerRunning = $false
+        if (($distros | Where-Object { $_.Name -like 'docker-desktop*' }) -and (Test-Tool 'docker')) {
+            $dockerRunning = (Invoke-Timed 'docker' 'info' 20).Ok
+        }
+        foreach ($d in $distros) {
+            $res = $null
+            if (Test-Path -LiteralPath $d.Vhd) {
+                if ($d.Name -notlike 'docker-desktop*' -or $dockerRunning) {
+                    Start-Step "Trim free space: $($d.Name)"
+                    Write-Info "exec  wsl -d $($d.Name) -u root -e /sbin/fstrim -av"
+                    $res = Invoke-Trim $d $dockerRunning
+                    foreach ($l in $res.Output) { Write-Detail "> $l" }
+                    if ($res.Ok) { End-Step 'trimmed' } else { End-Step ('trim failed (exit {0})' -f $res.ExitCode) 'Yellow' }
+                }
+            }
+            if ($res) { $results += $res }
+        }
+    }
+    try { ConvertTo-Json -InputObject @($results) -Depth 4 | Set-Content -LiteralPath $TrimResultFile -Encoding UTF8 } catch { }
+
+    Start-Step 'Request administrator rights'
+    try {
+        Start-Process -FilePath $env:CLEANER_PATH -ArgumentList ('/user:' + $CurrentSid) -Verb RunAs -ErrorAction Stop
+        End-Step 'continuing in the admin window'
+        exit 10
+    } catch {
+        Remove-Item -LiteralPath $TrimResultFile -Force -ErrorAction SilentlyContinue
+        End-Step 'administrator rights were not granted, nothing was cleaned' 'Red'
+        exit 1
+    }
+}
+
+# =====================================================================
+#  Stage 2: admin.
+# =====================================================================
+
+# Trim results from stage 1 (read now, before Temp is cleaned).
+$PreTrim = @{}
+if (Test-Path -LiteralPath $TrimResultFile) {
+    try {
+        foreach ($t in @(Get-Content -LiteralPath $TrimResultFile -Raw | ConvertFrom-Json)) { if ($t.Name) { $PreTrim[$t.Name] = $t } }
+    } catch { }
+    Remove-Item -LiteralPath $TrimResultFile -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------
@@ -176,10 +327,6 @@ function Remove-Items([string]$Label, [string[]]$Paths) {
     $done = 0; $busy = 0; $bytes = 0
     foreach ($t in $targets) {
         $size = Get-EntrySize $t
-        if ($DryRun) {
-            Write-Detail ('rm    {0}  ({1})  [dry run]' -f (Short $t.FullName), (Format-Size $size))
-            $done++; $bytes += $size; continue
-        }
         if (Remove-Entry $t) {
             $done++; $bytes += $size
             Write-Detail ('rm    {0}  ({1})' -f (Short $t.FullName), (Format-Size $size))
@@ -205,54 +352,6 @@ function Clear-Folder([string]$Label, [string[]]$Folders) {
     Remove-Items $Label $paths
 }
 
-# ---------------------------------------------------------------------
-#  Process helpers
-# ---------------------------------------------------------------------
-# Runs a command, prints its output, returns its exit code.
-function Invoke-Tool([string]$Name, [string[]]$Arguments) {
-    Write-Info ('exec  {0} {1}' -f $Name, ($Arguments -join ' '))
-    $out = @(); $code = $null
-    try {
-        $out  = @(& $Name @Arguments 2>&1 | ForEach-Object { "$_" })
-        $code = $LASTEXITCODE
-    } catch { $out = @($_.Exception.Message); $code = 1 }
-    if ($null -eq $code) { $code = 0 }
-    $lines = @($out | Where-Object { $_.Trim() })
-    if ($lines.Count -le 12) {
-        foreach ($l in $lines) { Write-Detail "> $l" }
-    } else {
-        foreach ($l in ($lines | Select-Object -First 8)) { Write-Detail "> $l" }
-        Write-Detail ("> ... {0} more lines ..." -f ($lines.Count - 11))
-        foreach ($l in ($lines | Select-Object -Last 3)) { Write-Detail "> $l" }
-    }
-    return $code
-}
-
-# Runs a program with a time limit and captures its output.
-function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
-    $r = [pscustomobject]@{ Ok = $false; ExitCode = $null; Output = @() }
-    $o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()
-    try {
-        $p = Start-Process -FilePath $File -ArgumentList $Arguments -NoNewWindow -PassThru `
-             -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop
-        # Reading Handle keeps ExitCode available after a timed wait (PowerShell quirk).
-        $null = $p.Handle
-        if (-not $p.WaitForExit($Seconds * 1000)) {
-            try { $p.Kill() } catch { }
-            $r.Output = @("timed out after $Seconds s")
-            return $r
-        }
-        $p.WaitForExit()
-        $r.ExitCode = $p.ExitCode
-        $r.Ok = ($p.ExitCode -eq 0)
-        # wsl.exe writes UTF-16 messages; strip the NULs so they read normally.
-        $r.Output = @((Get-Content -LiteralPath $o -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $e -ErrorAction SilentlyContinue) |
-                      ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
-    } catch { $r.Output = @($_.Exception.Message) }
-    finally { Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue }
-    return $r
-}
-
 # A developer cache: use the tool's own clean command when it is installed
 # for this user, otherwise delete the cache folder the tool reports or the
 # vendor's default folder.
@@ -264,11 +363,6 @@ function Clear-DevCache {
         $existing = @($Folders | Where-Object { Test-Path -LiteralPath $_ })
         foreach ($f in $existing) { Write-Info "cache $(Short $f)" }
         $before = Get-FolderSize $existing
-        if ($DryRun) {
-            Write-Info ('exec  {0} {1}  [dry run]' -f $Tool, ($CleanArgs -join ' '))
-            End-Step "$(Format-Size $before) in cache"
-            return
-        }
         $code  = Invoke-Tool $Tool $CleanArgs
         $after = Get-FolderSize $existing
         $freed = [Math]::Max(0, $before - $after)
@@ -314,24 +408,8 @@ function Get-FreeSpace {
 # ---------------------------------------------------------------------
 #  Start
 # ---------------------------------------------------------------------
-try {
-    $Host.UI.RawUI.WindowTitle     = 'Cleaner'
-    $Host.UI.RawUI.BackgroundColor = 'Black'
-    $Host.UI.RawUI.ForegroundColor = 'Green'
-    Clear-Host
-} catch { }
+Show-Banner
 $RunTimer = [Diagnostics.Stopwatch]::StartNew()
-
-$banner = @(
-    '   ________    _________    _   ____________ '
-    '  / ____/ /   / ____/   |  / | / / ____/ __ \'
-    ' / /   / /   / __/ / /| | /  |/ / __/ / /_/ /'
-    '/ /___/ /___/ /___/ ___ |/ /|  / /___/ _, _/ '
-    '\____/_____/_____/_/  |_/_/ |_/_____/_/ |_|  '
-)
-Write-Host ''
-foreach ($l in $banner) { Write-Host "  $l" -ForegroundColor Green }
-Write-Host ''
 
 $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
 $FreeBefore = Get-FreeSpace
@@ -340,24 +418,15 @@ Write-Host ('[*] user    : {0}' -f $UserProfile) -ForegroundColor DarkGreen
 Write-Host ('[*] admin   : {0}' -f $(if ($IsAdmin) { 'yes' } else { 'no' })) -ForegroundColor DarkGreen
 Write-Host ('[*] os      : {0} (build {1})' -f $os.Caption, $os.BuildNumber) -ForegroundColor DarkGreen
 Write-Host ('[*] drives  : {0}' -f (($FreeBefore.Keys | ForEach-Object { "$_ $(Format-Size $FreeBefore[$_]) free" }) -join ' | ')) -ForegroundColor DarkGreen
-if ($DryRun) { Write-Host '[!] dry run: nothing will be changed' -ForegroundColor Yellow }
-
-if (-not $IsAdmin -and -not $DryRun) {
-    Write-Host '[x] not running as administrator. Double-click cleaner.bat to elevate.' -ForegroundColor Red
-    return
-}
-if (-not $DryRun) {
-    Write-Host '[!] close your browsers and apps for the best result' -ForegroundColor Yellow
-    Write-Host '[!] WSL and Docker Desktop will be shut down to compact their disks' -ForegroundColor Yellow
-}
+Write-Host '[!] close your browsers and apps for the best result' -ForegroundColor Yellow
+Write-Host '[!] WSL and Docker Desktop will be shut down to compact their disks' -ForegroundColor Yellow
 
 # Optional log file, saved next to cleaner.bat (or in the user's profile
 # if that folder is read-only). No answer in 30 s means no log.
 $LogFile = $null
 Write-Section 'Log'
 Start-Step 'Log file'
-if ($DryRun) { End-Step 'dry run, no log' }
-elseif (Read-YesNo 'Save a log file of this run?' 30) {
+if (Read-YesNo 'Save a log file of this run?' 30) {
     $name = 'cleaner-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)
     foreach ($dir in @((Split-Path -Parent $env:CLEANER_PATH), $UserProfile)) {
         if (-not $dir) { continue }
@@ -385,33 +454,26 @@ Clear-Folder 'Prefetch' @(Join-Path $env:WINDIR 'Prefetch')
 Write-Section 'Windows Update'
 # ---------------------------------------------------------------------
 $wuServices = 'wuauserv', 'bits'
-if (-not $DryRun) {
-    Start-Step 'Stop update services'
-    foreach ($s in $wuServices) { Write-Info "stop  $s" }
-    Stop-Service -Name $wuServices -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    End-Step 'stopped'
-}
+Start-Step 'Stop update services'
+foreach ($s in $wuServices) { Write-Info "stop  $s" }
+Stop-Service -Name $wuServices -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+End-Step 'stopped'
 Clear-Folder 'Windows Update download cache' @(Join-Path $env:WINDIR 'SoftwareDistribution\Download')
 Clear-Folder 'Windows Update logs'           @(Join-Path $env:WINDIR 'SoftwareDistribution\DataStore\Logs')
-if (-not $DryRun) {
-    Start-Step 'Start update services'
-    foreach ($s in $wuServices) { Write-Info "start $s" }
-    Start-Service -Name $wuServices -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    End-Step 'started'
-}
+Start-Step 'Start update services'
+foreach ($s in $wuServices) { Write-Info "start $s" }
+Start-Service -Name $wuServices -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+End-Step 'started'
 
 $doCache = Join-Path $env:WINDIR 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
 if (Test-Tool 'Delete-DeliveryOptimizationCache') {
     Start-Step 'Delivery Optimization cache'
     $before = Get-FolderSize @($doCache)
     Write-Info 'exec  Delete-DeliveryOptimizationCache -Force'
-    if ($DryRun) { End-Step "$(Format-Size $before) in cache  [dry run]" }
-    else {
-        try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop *> $null } catch { Write-Warn $_.Exception.Message }
-        $freed = [Math]::Max(0, $before - (Get-FolderSize @($doCache)))
-        $script:TotalFreed += $freed
-        End-Step "$(Format-Size $freed) freed"
-    }
+    try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop *> $null } catch { Write-Warn $_.Exception.Message }
+    $freed = [Math]::Max(0, $before - (Get-FolderSize @($doCache)))
+    $script:TotalFreed += $freed
+    End-Step "$(Format-Size $freed) freed"
 } else {
     Clear-Folder 'Delivery Optimization cache' @($doCache)
 }
@@ -482,19 +544,15 @@ Clear-Folder 'Error reports (system)' @((Join-Path $werSys 'ReportQueue'), (Join
 $defHistory = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Scans\History'
 Clear-Folder 'Defender scan history' @((Join-Path $defHistory 'Service\DetectionHistory'), (Join-Path $defHistory 'CacheManager'))
 
-if (-not $DryRun) {
-    Start-Step 'Stop font cache service'
-    Write-Info 'stop  FontCache'
-    Stop-Service -Name 'FontCache' -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    End-Step 'stopped'
-}
+Start-Step 'Stop font cache service'
+Write-Info 'stop  FontCache'
+Stop-Service -Name 'FontCache' -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+End-Step 'stopped'
 Remove-Items 'Font cache' @((Join-Path $env:WINDIR 'ServiceProfiles\LocalService\AppData\Local\FontCache\*'), (Join-Path $env:WINDIR 'System32\FNTCACHE.DAT'))
-if (-not $DryRun) {
-    Start-Step 'Start font cache service'
-    Write-Info 'start FontCache'
-    Start-Service -Name 'FontCache' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-    End-Step 'started'
-}
+Start-Step 'Start font cache service'
+Write-Info 'start FontCache'
+Start-Service -Name 'FontCache' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+End-Step 'started'
 
 Clear-Folder 'Crash dumps (user)'   @(Join-Path $Local 'CrashDumps')
 Clear-Folder 'Crash dumps (system)' @(Join-Path $env:WINDIR 'Minidump')
@@ -592,15 +650,19 @@ Clear-Folder 'Pipenv cache' @((First-Set $env:PIPENV_CACHE_DIR (Join-Path $Local
 
 if ($SameUser -and (Test-Tool 'conda')) { Clear-DevCache 'Conda packages and tarballs' 'conda' @('clean', '--all', '--yes') @() }
 
-# NuGet: clear the download and temp caches. global-packages is kept so
-# projects do not need a full restore.
-$nugetHttp = First-Set $env:NUGET_HTTP_CACHE_PATH (Join-Path $Local 'NuGet\v3-cache')
-if ($SameUser -and (Test-Tool 'dotnet')) {
+# NuGet: clear the download and temp caches, keep global-packages so
+# projects do not need a full restore. "dotnet nuget" only exists when a
+# .NET SDK is installed (the runtime alone does not have it).
+$nugetHttp    = First-Set $env:NUGET_HTTP_CACHE_PATH (Join-Path $Local 'NuGet\v3-cache')
+$nugetPlugins = First-Set $env:NUGET_PLUGINS_CACHE_PATH (Join-Path $Local 'NuGet\plugins-cache')
+$hasDotnetSdk = $SameUser -and (Test-Tool 'dotnet') -and [bool](Get-ToolOutput 'dotnet' @('--list-sdks'))
+if ($hasDotnetSdk) {
     Clear-DevCache 'NuGet HTTP cache'    'dotnet' @('nuget', 'locals', 'http-cache', '--clear')    @($nugetHttp)
     Clear-DevCache 'NuGet temp cache'    'dotnet' @('nuget', 'locals', 'temp', '--clear')          @()
-    Clear-DevCache 'NuGet plugins cache' 'dotnet' @('nuget', 'locals', 'plugins-cache', '--clear') @(Join-Path $Local 'NuGet\plugins-cache')
+    Clear-DevCache 'NuGet plugins cache' 'dotnet' @('nuget', 'locals', 'plugins-cache', '--clear') @($nugetPlugins)
 } else {
-    Clear-Folder 'NuGet HTTP cache' @($nugetHttp, (Join-Path $Local 'NuGet\plugins-cache'))
+    Clear-Folder 'NuGet HTTP cache'    @($nugetHttp)
+    Clear-Folder 'NuGet plugins cache' @($nugetPlugins)
 }
 
 $goCache = $null
@@ -643,9 +705,6 @@ if (Test-Tool 'docker') {
     if (-not $DockerUp) {
         Write-Info 'engine not running'
         End-Step 'skipped'
-    } elseif ($DryRun) {
-        Write-Info 'engine running, would ask y/N (60 s)  [dry run]'
-        End-Step 'dry run'
     } elseif (Read-YesNo 'Remove unused Docker images and build cache? Containers and volumes are kept.' 60) {
         $c1 = Invoke-Tool 'docker' @('image', 'prune', '--all', '--force')
         $c2 = Invoke-Tool 'docker' @('builder', 'prune', '--all', '--force')
@@ -674,19 +733,9 @@ function Add-Disk([string]$Path, [string]$Source) {
 }
 
 Start-Step 'Discover virtual disks'
-$wslDistros = @()
-$lxss = Join-Path $UserHive 'Software\Microsoft\Windows\CurrentVersion\Lxss'
 Write-Info 'scan  WSL registry (Lxss)'
-if (Test-Path $lxss) {
-    Get-ChildItem $lxss -ErrorAction SilentlyContinue | ForEach-Object {
-        $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-        if (-not $p.BasePath) { return }
-        $vhdName = if ($p.VhdFileName) { $p.VhdFileName } else { 'ext4.vhdx' }
-        $vhd = Join-Path ($p.BasePath -replace '^\\\\\?\\', '') $vhdName
-        $wslDistros += [pscustomobject]@{ Name = $p.DistributionName; Vhd = $vhd }
-        Add-Disk $vhd "WSL: $($p.DistributionName)"
-    }
-}
+$wslDistros = @(Get-WslDistros)
+foreach ($w in $wslDistros) { Add-Disk $w.Vhd "WSL: $($w.Name)" }
 
 Write-Info 'scan  Docker Desktop settings and data folders'
 $dockerDirs = @(Join-Path $Local 'Docker\wsl')
@@ -731,18 +780,25 @@ End-Step ('{0} disk(s), {1} on disk' -f $disks.Count, (Format-Size $diskTotal))
 if ($disks.Count -gt 0) {
     $haveWsl = ($wslDistros.Count -gt 0) -and (Test-Tool 'wsl')
 
-    # 1. Trim: tell each Linux filesystem which blocks are free, so the
-    #    compaction can actually return them to Windows.
+    # 1. Trim. Normally done in stage 1 as the user; shown here. If stage 1
+    #    did not run (started as admin directly), try it now.
     if ($haveWsl) {
         foreach ($w in $wslDistros) {
-            if (-not (Test-Path -LiteralPath $w.Vhd)) { continue }   # WSL 1 distro, no disk
-            if ($w.Name -like 'docker-desktop*' -and -not $DockerUp) { continue }
-            Start-Step "Trim free space: $($w.Name)"
-            Write-Info "exec  wsl -d $($w.Name) -u root -e fstrim -av"
-            if ($DryRun) { End-Step 'dry run'; continue }
-            $r = Invoke-Timed 'wsl.exe' "-d `"$($w.Name)`" -u root -e fstrim -av" 180
-            foreach ($l in $r.Output) { Write-Detail "> $l" }
-            if ($r.Ok) { End-Step 'trimmed' } else { End-Step ("trim failed (exit {0}), compacting anyway" -f $r.ExitCode) 'Yellow' }
+            if (-not (Test-Path -LiteralPath $w.Vhd)) { continue }
+            $res = $PreTrim[$w.Name]
+            if ($res) {
+                Start-Step "Trim free space: $($w.Name)"
+                Write-Info 'done before elevation, as your normal account'
+            } else {
+                if ($w.Name -like 'docker-desktop*' -and -not $DockerUp) { continue }
+                Start-Step "Trim free space: $($w.Name)"
+                Write-Info "exec  wsl -d $($w.Name) -u root -e /sbin/fstrim -av"
+                $res = Invoke-Trim $w $DockerUp
+                if (-not $res) { End-Step 'skipped'; continue }
+            }
+            foreach ($l in @($res.Output)) { Write-Detail "> $l" }
+            if ($res.Ok) { End-Step 'trimmed' }
+            else { End-Step ('trim failed (exit {0}), compacting anyway. Double-click cleaner.bat instead of "Run as administrator" so it can trim first.' -f $res.ExitCode) 'Yellow' }
         }
     }
 
@@ -751,20 +807,17 @@ if ($disks.Count -gt 0) {
     if ($dockerProcs.Count -gt 0) {
         Start-Step 'Stop Docker Desktop'
         foreach ($p in $dockerProcs) { Write-Detail ('kill  {0} (pid {1})' -f $p.ProcessName, $p.Id) }
-        if (-not $DryRun) { $dockerProcs | Stop-Process -Force -ErrorAction SilentlyContinue }
-        End-Step $(if ($DryRun) { 'dry run' } else { 'stopped' })
+        $dockerProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+        End-Step 'stopped'
     }
     if ($haveWsl) {
         Start-Step 'Shut down WSL'
         Write-Info 'exec  wsl --shutdown'
-        if ($DryRun) { End-Step 'dry run' }
-        else {
-            $null = Invoke-Timed 'wsl.exe' '--shutdown' 60
-            $deadline = (Get-Date).AddSeconds(30)
-            while ((Get-Process -Name 'vmmem', 'vmmemWSL' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
-            Start-Sleep -Seconds 2
-            End-Step 'WSL is down'
-        }
+        $null = Invoke-Timed 'wsl.exe' '--shutdown' 60
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Process -Name 'vmmem', 'vmmemWSL' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+        Start-Sleep -Seconds 2
+        End-Step 'WSL is down'
     }
 
     # 3. Compact with diskpart, which ships with every Windows edition.
@@ -774,7 +827,6 @@ if ($disks.Count -gt 0) {
         Start-Step "Compact $($d.Source)"
         Write-Info "disk  $(Short $d.Path)"
         Write-Info 'exec  diskpart: select vdisk / attach readonly / compact / detach'
-        if ($DryRun) { End-Step "$(Format-Size $before) now  [dry run]"; continue }
         $dp = [IO.Path]::GetTempFileName()
         $okCompact = $false
         $out = @()
@@ -801,7 +853,7 @@ if ($disks.Count -gt 0) {
         }
     }
     $script:TotalFreed += $saved
-    if ($dockerProcs.Count -gt 0 -and -not $DryRun) { Write-Host '[!] Docker Desktop was stopped. Start it again when you need it.' -ForegroundColor Yellow }
+    if ($dockerProcs.Count -gt 0) { Write-Host '[!] Docker Desktop was stopped. Start it again when you need it.' -ForegroundColor Yellow }
 }
 
 # ---------------------------------------------------------------------
@@ -809,41 +861,34 @@ Write-Section 'System cleanup'
 # ---------------------------------------------------------------------
 Start-Step 'Recycle Bin (all drives)'
 Write-Info 'exec  Clear-RecycleBin -Force'
-if ($DryRun) { End-Step 'dry run' } else { Clear-RecycleBin -Force -ErrorAction SilentlyContinue; End-Step 'emptied' }
+Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+End-Step 'emptied'
 
 Start-Step 'Event logs'
 $logs = @(& wevtutil.exe el 2>$null)
 Write-Info "found $($logs.Count) logs"
-if ($DryRun) { End-Step 'dry run' }
-else {
-    $n = 0; $failed = @()
-    foreach ($l in $logs) {
-        & wevtutil.exe cl "$l" 2>$null
-        if ($LASTEXITCODE -eq 0) { $n++ } else { $failed += $l }
-    }
-    foreach ($f in $failed) { Write-Warn "kept  $f (protected)" }
-    End-Step "cleared $n of $($logs.Count)"
+$n = 0; $failed = @()
+foreach ($l in $logs) {
+    & wevtutil.exe cl "$l" 2>$null
+    if ($LASTEXITCODE -eq 0) { $n++ } else { $failed += $l }
 }
+foreach ($f in $failed) { Write-Warn "kept  $f (protected)" }
+End-Step "cleared $n of $($logs.Count)"
 
 Start-Step 'DNS cache'
 Write-Info 'exec  ipconfig /flushdns'
-if ($DryRun) { End-Step 'dry run' } else { $null = & ipconfig.exe /flushdns; End-Step 'flushed' }
+$null = & ipconfig.exe /flushdns
+End-Step 'flushed'
 
 Start-Step 'Storage Sense'
 Write-Info 'exec  scheduled task \Microsoft\Windows\DiskFootprint\StorageSense'
-if ($DryRun) { End-Step 'dry run' }
-else {
-    try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; End-Step 'triggered' }
-    catch { End-Step 'not available on this system' 'Yellow' }
-}
+try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; End-Step 'triggered' }
+catch { End-Step 'not available on this system' 'Yellow' }
 
 Start-Step 'Windows component store (can take a few minutes)'
 Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup'
-if ($DryRun) { End-Step 'dry run' }
-else {
-    & dism.exe /online /Cleanup-Image /StartComponentCleanup /Quiet
-    End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
-}
+& dism.exe /online /Cleanup-Image /StartComponentCleanup /Quiet
+End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
 
 # ---------------------------------------------------------------------
 Write-Section 'Summary'
@@ -857,8 +902,7 @@ foreach ($k in $FreeAfter.Keys) {
 }
 Write-Host ('[+] measured by the steps above: {0}' -f (Format-Size $script:TotalFreed)) -ForegroundColor Green
 Write-Host ('[+] {0} steps in {1:mm\:ss}' -f $script:StepNo, $RunTimer.Elapsed) -ForegroundColor Green
-if ($DryRun) { Write-Host '[!] dry run finished, nothing was changed' -ForegroundColor Yellow }
-else { Write-Host '[+] done' -ForegroundColor Green }
+Write-Host '[+] done' -ForegroundColor Green
 if ($LogFile) {
     Write-Host ('[+] log saved: {0}' -f $LogFile) -ForegroundColor Green
     try { Stop-Transcript | Out-Null } catch { }
