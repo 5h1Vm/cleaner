@@ -1,13 +1,13 @@
 <# : cleaner.bat - batch launcher. The PowerShell part starts after the closing comment tag.
 @echo off
 setlocal
+title Cleaner
 set "CLEANER_PATH=%~f0"
 set "CLEANER_ARGS=%*"
-if /i "%~1"=="/dry" goto run
-if /i "%~1"=="/?" goto run
+if defined CLEANER_DRYRUN goto run
 fltmc >nul 2>&1 && goto run
-echo Requesting administrator rights...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; try { Start-Process -FilePath $env:CLEANER_PATH -ArgumentList ('/user:' + $s) -Verb RunAs -ErrorAction Stop } catch { Write-Host 'Administrator rights were not granted. Nothing was cleaned.'; Start-Sleep -Seconds 5 }"
+echo [*] Requesting administrator rights...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; try { Start-Process -FilePath $env:CLEANER_PATH -ArgumentList ('/user:' + $s) -Verb RunAs -ErrorAction Stop } catch { Write-Host '[x] Administrator rights were not granted. Nothing was cleaned.' -ForegroundColor Red; Start-Sleep -Seconds 5 }"
 exit /b
 :run
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create([IO.File]::ReadAllText($env:CLEANER_PATH)))"
@@ -21,8 +21,6 @@ exit /b
 #  https://github.com/5h1Vm/cleaner
 #
 #  Double-click cleaner.bat. It asks for admin rights, then runs below.
-#  cleaner.bat /dry   shows what would be cleaned, changes nothing
-#  cleaner.bat /?     shows help
 #
 #  Nothing here is specific to one machine. Every location is resolved
 #  at runtime: from the tool itself, its environment variables, the
@@ -34,19 +32,10 @@ $ProgressPreference    = 'SilentlyContinue'
 # Protected folders (Defender, Search) raise "Access is denied" on Test-Path.
 # Treat those as "not reachable" instead of printing errors.
 $PSDefaultParameterValues['Test-Path:ErrorAction'] = 'SilentlyContinue'
-$Version = '2.0.0'
 
+# For testing only: set CLEANER_DRYRUN=1 to list what would be removed.
+$DryRun  = [bool]$env:CLEANER_DRYRUN
 $ArgText = [string]$env:CLEANER_ARGS
-$DryRun  = $ArgText -match '(^|\s)[/-]dry(\s|$)'
-
-if ($ArgText -match '(^|\s)[/-](\?|h|help)(\s|$)') {
-    Write-Host "Cleaner $Version"
-    Write-Host ''
-    Write-Host '  cleaner.bat         clean everything (asks for admin rights)'
-    Write-Host '  cleaner.bat /dry    show what would be cleaned, change nothing'
-    Write-Host '  cleaner.bat /?      this help'
-    return
-}
 
 # ---------------------------------------------------------------------
 #  Who are we cleaning for?
@@ -79,11 +68,32 @@ $UserHive = "Registry::HKEY_USERS\$TargetSid"
 $IsAdmin  = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # ---------------------------------------------------------------------
-#  Helpers
+#  Output
+#    [*] section     [>] step starts     |  detail lines
+#    [i] info        [!] warning         '- [+] step result
 # ---------------------------------------------------------------------
-function Write-Section([string]$t) { Write-Host ''; Write-Host "== $t" -ForegroundColor Cyan }
-function Write-Step([string]$t)    { Write-Host "  - $t" }
-function Write-Note([string]$t)    { Write-Host "      $t" -ForegroundColor DarkGray }
+$script:StepNo     = 0
+$script:Timer      = $null
+$script:TotalFreed = 0
+
+function Write-Section([string]$t) {
+    $bar = '=' * [Math]::Max(4, 60 - $t.Length)
+    Write-Host ''
+    Write-Host ('[*] ===[ {0} ]{1}' -f $t.ToUpper(), $bar) -ForegroundColor Green
+}
+function Start-Step([string]$t) {
+    $script:StepNo++
+    $script:Timer = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host ('[>] 0x{0:X2}  {1}' -f $script:StepNo, $t) -ForegroundColor Green
+}
+function Write-Detail([string]$t) { Write-Host "    |  $t"     -ForegroundColor DarkGreen }
+function Write-Info([string]$t)   { Write-Host "    |  [i] $t" -ForegroundColor DarkGreen }
+function Write-Warn([string]$t)   { Write-Host "    |  [!] $t" -ForegroundColor Yellow }
+function End-Step([string]$t, [string]$Color = 'Green') {
+    $tag  = if ($Color -eq 'Green') { '[+]' } else { '[!]' }
+    $time = if ($script:Timer) { ' | {0:N2}s' -f $script:Timer.Elapsed.TotalSeconds } else { '' }
+    Write-Host ("    '- {0} {1}{2}" -f $tag, $t, $time) -ForegroundColor $Color
+}
 
 function Format-Size([double]$b) {
     if ($b -ge 1GB) { return ('{0:N2} GB' -f ($b / 1GB)) }
@@ -91,8 +101,47 @@ function Format-Size([double]$b) {
     return ('{0:N0} KB' -f ($b / 1KB))
 }
 
+# Shows paths inside the user's profile as ~\...
+function Short([string]$p) {
+    if ($p -and $UserProfile -and $p.StartsWith($UserProfile, [StringComparison]::OrdinalIgnoreCase)) {
+        return '~' + $p.Substring($UserProfile.Length)
+    }
+    return $p
+}
+
 # Returns the first argument that is not empty.
 function First-Set { foreach ($a in $args) { if ($a) { return $a } }; return $null }
+
+function Test-Tool([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
+
+# Runs a command quietly and returns its trimmed text output (used to ask
+# tools where their caches live).
+function Get-ToolOutput([string]$Name, [string[]]$Arguments) {
+    try { return ((& $Name @Arguments 2>$null | Out-String).Trim()) } catch { return $null }
+}
+
+# ---------------------------------------------------------------------
+#  File helpers
+# ---------------------------------------------------------------------
+function Get-EntrySize($Item) {
+    try {
+        if ($Item -is [IO.FileInfo]) { return [double]$Item.Length }
+        if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return 0 }
+        $s = (Get-ChildItem -LiteralPath $Item.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        if ($s) { return [double]$s }
+    } catch { }
+    return 0
+}
+
+function Get-FolderSize([string[]]$Folders) {
+    $t = 0
+    foreach ($f in $Folders) {
+        if (-not ($f -and (Test-Path -LiteralPath $f))) { continue }
+        $s = (Get-ChildItem -LiteralPath $f -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        if ($s) { $t += $s }
+    }
+    return [double]$t
+}
 
 # Deletes one file or folder. Folders go through "rd /s /q", which removes
 # junctions and symlinks without following them into their targets.
@@ -112,24 +161,42 @@ function Remove-Entry([IO.FileSystemInfo]$Item) {
     return -not (Test-Path -LiteralPath $Item.FullName)
 }
 
-# Removes everything matching each path pattern, e.g. "C:\x\*" or "C:\x\*.db".
-# Locked or protected files are skipped quietly.
+# Removes everything matching each path pattern, e.g. "C:\x\*" or "C:\x\*.db",
+# and prints every entry. Locked or protected entries are reported and kept.
 function Remove-Items([string]$Label, [string[]]$Paths) {
+    $Paths = @($Paths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($Paths.Count -eq 0) { return }
+    Start-Step $Label
     $targets = @()
     foreach ($p in $Paths) {
-        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        Write-Info "scan  $(Short $p)"
         $targets += @(Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue)
     }
-    if ($targets.Count -eq 0) { return }
-    Write-Step $Label
-    if ($DryRun) { Write-Note "would remove $($targets.Count) item(s)"; return }
-    $done = 0
-    foreach ($t in $targets) { if (Remove-Entry $t) { $done++ } }
-    $left = $targets.Count - $done
-    if ($left -gt 0) { Write-Note "removed $done, skipped $left in use" } else { Write-Note "removed $done" }
+    if ($targets.Count -eq 0) { End-Step 'already clean'; return }
+    $done = 0; $busy = 0; $bytes = 0
+    foreach ($t in $targets) {
+        $size = Get-EntrySize $t
+        if ($DryRun) {
+            Write-Detail ('rm    {0}  ({1})  [dry run]' -f (Short $t.FullName), (Format-Size $size))
+            $done++; $bytes += $size; continue
+        }
+        if (Remove-Entry $t) {
+            $done++; $bytes += $size
+            Write-Detail ('rm    {0}  ({1})' -f (Short $t.FullName), (Format-Size $size))
+        } else {
+            $busy++
+            Write-Warn ('busy  {0}' -f (Short $t.FullName))
+        }
+    }
+    $script:TotalFreed += $bytes
+    $msg = "$done removed"
+    if ($busy) { $msg += " | $busy in use" }
+    $msg += " | $(Format-Size $bytes) freed"
+    End-Step $msg $(if ($busy) { 'Yellow' } else { 'Green' })
 }
 
-# Contents of each folder (not the folder itself).
+# Clears the contents of each folder that exists (not the folder itself).
+# Folders that do not exist on this machine are skipped silently.
 function Clear-Folder([string]$Label, [string[]]$Folders) {
     $paths = @()
     foreach ($f in $Folders) {
@@ -138,23 +205,52 @@ function Clear-Folder([string]$Label, [string[]]$Folders) {
     Remove-Items $Label $paths
 }
 
-function Test-Tool([string]$Name) { return [bool](Get-Command $Name -ErrorAction SilentlyContinue) }
-
-# Runs a command quietly and returns its trimmed text output.
-function Get-ToolOutput([string]$Name, [string[]]$Arguments) {
-    try { return ((& $Name @Arguments 2>$null | Out-String).Trim()) } catch { return $null }
+# ---------------------------------------------------------------------
+#  Process helpers
+# ---------------------------------------------------------------------
+# Runs a command, prints its output, returns its exit code.
+function Invoke-Tool([string]$Name, [string[]]$Arguments) {
+    Write-Info ('exec  {0} {1}' -f $Name, ($Arguments -join ' '))
+    $out = @(); $code = $null
+    try {
+        $out  = @(& $Name @Arguments 2>&1 | ForEach-Object { "$_" })
+        $code = $LASTEXITCODE
+    } catch { $out = @($_.Exception.Message); $code = 1 }
+    if ($null -eq $code) { $code = 0 }
+    $lines = @($out | Where-Object { $_.Trim() })
+    if ($lines.Count -le 12) {
+        foreach ($l in $lines) { Write-Detail "> $l" }
+    } else {
+        foreach ($l in ($lines | Select-Object -First 8)) { Write-Detail "> $l" }
+        Write-Detail ("> ... {0} more lines ..." -f ($lines.Count - 11))
+        foreach ($l in ($lines | Select-Object -Last 3)) { Write-Detail "> $l" }
+    }
+    return $code
 }
 
-# Runs a program with a time limit. Returns $true if it exited with code 0.
+# Runs a program with a time limit and captures its output.
 function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
+    $r = [pscustomobject]@{ Ok = $false; ExitCode = $null; Output = @() }
     $o = [IO.Path]::GetTempFileName(); $e = [IO.Path]::GetTempFileName()
     try {
         $p = Start-Process -FilePath $File -ArgumentList $Arguments -NoNewWindow -PassThru `
              -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop
-        if (-not $p.WaitForExit($Seconds * 1000)) { try { $p.Kill() } catch { }; return $false }
-        return ($p.ExitCode -eq 0)
-    } catch { return $false }
-    finally { Remove-Item $o, $e -Force -ErrorAction SilentlyContinue }
+        # Reading Handle keeps ExitCode available after a timed wait (PowerShell quirk).
+        $null = $p.Handle
+        if (-not $p.WaitForExit($Seconds * 1000)) {
+            try { $p.Kill() } catch { }
+            $r.Output = @("timed out after $Seconds s")
+            return $r
+        }
+        $p.WaitForExit()
+        $r.ExitCode = $p.ExitCode
+        $r.Ok = ($p.ExitCode -eq 0)
+        # wsl.exe writes UTF-16 messages; strip the NULs so they read normally.
+        $r.Output = @((Get-Content -LiteralPath $o -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $e -ErrorAction SilentlyContinue) |
+                      ForEach-Object { ($_ -replace "`0", '').Trim() } | Where-Object { $_ })
+    } catch { $r.Output = @($_.Exception.Message) }
+    finally { Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue }
+    return $r
 }
 
 # A developer cache: use the tool's own clean command when it is installed
@@ -162,11 +258,24 @@ function Invoke-Timed([string]$File, [string]$Arguments, [int]$Seconds) {
 # vendor's default folder.
 function Clear-DevCache {
     param([string]$Label, [string]$Tool, [string[]]$CleanArgs, [string[]]$Folders)
+    $Folders = @($Folders | Where-Object { $_ })
     if ($Tool -and $CleanArgs -and $SameUser -and (Test-Tool $Tool)) {
-        Write-Step "$Label ($Tool $($CleanArgs -join ' '))"
-        if ($DryRun) { Write-Note 'would run the tool''s clean command'; return }
-        $null = Get-ToolOutput $Tool $CleanArgs
-        Write-Note 'done'
+        Start-Step $Label
+        $existing = @($Folders | Where-Object { Test-Path -LiteralPath $_ })
+        foreach ($f in $existing) { Write-Info "cache $(Short $f)" }
+        $before = Get-FolderSize $existing
+        if ($DryRun) {
+            Write-Info ('exec  {0} {1}  [dry run]' -f $Tool, ($CleanArgs -join ' '))
+            End-Step "$(Format-Size $before) in cache"
+            return
+        }
+        $code  = Invoke-Tool $Tool $CleanArgs
+        $after = Get-FolderSize $existing
+        $freed = [Math]::Max(0, $before - $after)
+        $script:TotalFreed += $freed
+        $msg = "exit $code"
+        if ($existing.Count) { $msg += " | $(Format-Size $freed) freed" }
+        End-Step $msg $(if ($code -eq 0) { 'Green' } else { 'Yellow' })
         return
     }
     Clear-Folder $Label $Folders
@@ -175,46 +284,94 @@ function Clear-DevCache {
 # y/N question that gives up after $Seconds with no key press.
 function Read-YesNo([string]$Question, [int]$Seconds) {
     try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } }
-    catch { Write-Note "$Question  (no keyboard available, skipped)"; return $false }
+    catch { Write-Warn "$Question  (no keyboard available, skipped)"; return $false }
     $end = (Get-Date).AddSeconds($Seconds); $last = -1
     while ((Get-Date) -lt $end) {
         $left = [int][math]::Ceiling(($end - (Get-Date)).TotalSeconds)
-        if ($left -ne $last) { Write-Host ("`r    $Question [y/N] ({0,2}s) " -f $left) -NoNewline; $last = $left }
+        if ($left -ne $last) {
+            Write-Host ("`r    |  [?] $Question [y/N] ({0,2}s) " -f $left) -ForegroundColor Yellow -NoNewline
+            $last = $left
+        }
         if ([Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true); Write-Host $k.KeyChar
+            $k = [Console]::ReadKey($true)
+            Write-Host $k.KeyChar -ForegroundColor Yellow
             return ($k.KeyChar -eq 'y' -or $k.KeyChar -eq 'Y')
         }
         Start-Sleep -Milliseconds 100
     }
-    Write-Host ''; Write-Note 'No answer, skipped.'
+    Write-Host ''
+    Write-Info 'no answer in time'
     return $false
 }
 
 function Get-FreeSpace {
-    $r = @{}
+    $r = [ordered]@{}
     Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
-        ForEach-Object { $r[$_.DeviceID] = [double]$_.FreeSpace }
+        Sort-Object DeviceID | ForEach-Object { $r[$_.DeviceID] = [double]$_.FreeSpace }
     return $r
 }
 
 # ---------------------------------------------------------------------
 #  Start
 # ---------------------------------------------------------------------
+try {
+    $Host.UI.RawUI.WindowTitle     = 'Cleaner'
+    $Host.UI.RawUI.BackgroundColor = 'Black'
+    $Host.UI.RawUI.ForegroundColor = 'Green'
+    Clear-Host
+} catch { }
+$RunTimer = [Diagnostics.Stopwatch]::StartNew()
+
+$banner = @(
+    '   ________    _________    _   ____________ '
+    '  / ____/ /   / ____/   |  / | / / ____/ __ \'
+    ' / /   / /   / __/ / /| | /  |/ / __/ / /_/ /'
+    '/ /___/ /___/ /___/ ___ |/ /|  / /___/ _, _/ '
+    '\____/_____/_____/_/  |_/_/ |_/_____/_/ |_|  '
+)
 Write-Host ''
-Write-Host '================================================'
-Write-Host "  Cleaner $Version"
-if ($DryRun) { Write-Host '  DRY RUN: nothing will be changed' -ForegroundColor Yellow }
-Write-Host '================================================'
-Write-Host "  User: $UserProfile"
+foreach ($l in $banner) { Write-Host "  $l" -ForegroundColor Green }
+Write-Host ''
+
+$os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+$FreeBefore = Get-FreeSpace
+Write-Host ('[*] host    : {0}' -f $env:COMPUTERNAME) -ForegroundColor DarkGreen
+Write-Host ('[*] user    : {0}' -f $UserProfile) -ForegroundColor DarkGreen
+Write-Host ('[*] admin   : {0}' -f $(if ($IsAdmin) { 'yes' } else { 'no' })) -ForegroundColor DarkGreen
+Write-Host ('[*] os      : {0} (build {1})' -f $os.Caption, $os.BuildNumber) -ForegroundColor DarkGreen
+Write-Host ('[*] drives  : {0}' -f (($FreeBefore.Keys | ForEach-Object { "$_ $(Format-Size $FreeBefore[$_]) free" }) -join ' | ')) -ForegroundColor DarkGreen
+if ($DryRun) { Write-Host '[!] dry run: nothing will be changed' -ForegroundColor Yellow }
+
 if (-not $IsAdmin -and -not $DryRun) {
-    Write-Host '  Not running as administrator. Double-click cleaner.bat to elevate.' -ForegroundColor Red
+    Write-Host '[x] not running as administrator. Double-click cleaner.bat to elevate.' -ForegroundColor Red
     return
 }
 if (-not $DryRun) {
-    Write-Host '  Close your browsers and apps for the best result.'
-    Write-Host '  WSL and Docker Desktop will be shut down to compact their disks.'
+    Write-Host '[!] close your browsers and apps for the best result' -ForegroundColor Yellow
+    Write-Host '[!] WSL and Docker Desktop will be shut down to compact their disks' -ForegroundColor Yellow
 }
-$FreeBefore = Get-FreeSpace
+
+# Optional log file, saved next to cleaner.bat (or in the user's profile
+# if that folder is read-only). No answer in 30 s means no log.
+$LogFile = $null
+Write-Section 'Log'
+Start-Step 'Log file'
+if ($DryRun) { End-Step 'dry run, no log' }
+elseif (Read-YesNo 'Save a log file of this run?' 30) {
+    $name = 'cleaner-{0:yyyy-MM-dd_HHmmss}.log' -f (Get-Date)
+    foreach ($dir in @((Split-Path -Parent $env:CLEANER_PATH), $UserProfile)) {
+        if (-not $dir) { continue }
+        $candidate = Join-Path $dir $name
+        try {
+            Start-Transcript -LiteralPath $candidate -ErrorAction Stop | Out-Null
+            $LogFile = $candidate
+            break
+        } catch { }
+    }
+    if ($LogFile) { End-Step "logging to $(Short $LogFile)" } else { End-Step 'could not create a log file, continuing without' 'Yellow' }
+} else {
+    End-Step 'no log'
+}
 
 # ---------------------------------------------------------------------
 Write-Section 'Temporary files'
@@ -225,27 +382,42 @@ Clear-Folder 'Temp folders' $tempDirs
 Clear-Folder 'Prefetch' @(Join-Path $env:WINDIR 'Prefetch')
 
 # ---------------------------------------------------------------------
-Write-Section 'Windows Update and Delivery Optimization'
+Write-Section 'Windows Update'
 # ---------------------------------------------------------------------
 $wuServices = 'wuauserv', 'bits'
-if (-not $DryRun) { Stop-Service -Name $wuServices -Force -ErrorAction SilentlyContinue }
+if (-not $DryRun) {
+    Start-Step 'Stop update services'
+    foreach ($s in $wuServices) { Write-Info "stop  $s" }
+    Stop-Service -Name $wuServices -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    End-Step 'stopped'
+}
 Clear-Folder 'Windows Update download cache' @(Join-Path $env:WINDIR 'SoftwareDistribution\Download')
 Clear-Folder 'Windows Update logs'           @(Join-Path $env:WINDIR 'SoftwareDistribution\DataStore\Logs')
-if (-not $DryRun) { Start-Service -Name $wuServices -ErrorAction SilentlyContinue }
+if (-not $DryRun) {
+    Start-Step 'Start update services'
+    foreach ($s in $wuServices) { Write-Info "start $s" }
+    Start-Service -Name $wuServices -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    End-Step 'started'
+}
 
 $doCache = Join-Path $env:WINDIR 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
-if ($DryRun) { Write-Step 'Delivery Optimization cache'; Write-Note 'would clear' }
-else {
-    $ok = $false
-    if (Test-Tool 'Delete-DeliveryOptimizationCache') {
-        try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop | Out-Null; $ok = $true } catch { }
+if (Test-Tool 'Delete-DeliveryOptimizationCache') {
+    Start-Step 'Delivery Optimization cache'
+    $before = Get-FolderSize @($doCache)
+    Write-Info 'exec  Delete-DeliveryOptimizationCache -Force'
+    if ($DryRun) { End-Step "$(Format-Size $before) in cache  [dry run]" }
+    else {
+        try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop *> $null } catch { Write-Warn $_.Exception.Message }
+        $freed = [Math]::Max(0, $before - (Get-FolderSize @($doCache)))
+        $script:TotalFreed += $freed
+        End-Step "$(Format-Size $freed) freed"
     }
-    if ($ok) { Write-Step 'Delivery Optimization cache'; Write-Note 'done' }
-    else     { Clear-Folder 'Delivery Optimization cache' @($doCache) }
+} else {
+    Clear-Folder 'Delivery Optimization cache' @($doCache)
 }
 
 # ---------------------------------------------------------------------
-Write-Section 'Browser caches (all profiles)'
+Write-Section 'Browser caches'
 # ---------------------------------------------------------------------
 # Chromium browsers keep every profile under "User Data". Profiles are
 # found by looking for their Preferences file, not by assuming "Default".
@@ -310,16 +482,24 @@ Clear-Folder 'Error reports (system)' @((Join-Path $werSys 'ReportQueue'), (Join
 $defHistory = Join-Path $env:ProgramData 'Microsoft\Windows Defender\Scans\History'
 Clear-Folder 'Defender scan history' @((Join-Path $defHistory 'Service\DetectionHistory'), (Join-Path $defHistory 'CacheManager'))
 
-if ($DryRun) { Write-Step 'Font cache'; Write-Note 'would rebuild' }
-else {
-    Stop-Service -Name 'FontCache' -Force -ErrorAction SilentlyContinue
-    Remove-Items 'Font cache' @((Join-Path $env:WINDIR 'ServiceProfiles\LocalService\AppData\Local\FontCache\*'), (Join-Path $env:WINDIR 'System32\FNTCACHE.DAT'))
-    Start-Service -Name 'FontCache' -ErrorAction SilentlyContinue
+if (-not $DryRun) {
+    Start-Step 'Stop font cache service'
+    Write-Info 'stop  FontCache'
+    Stop-Service -Name 'FontCache' -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    End-Step 'stopped'
+}
+Remove-Items 'Font cache' @((Join-Path $env:WINDIR 'ServiceProfiles\LocalService\AppData\Local\FontCache\*'), (Join-Path $env:WINDIR 'System32\FNTCACHE.DAT'))
+if (-not $DryRun) {
+    Start-Step 'Start font cache service'
+    Write-Info 'start FontCache'
+    Start-Service -Name 'FontCache' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    End-Step 'started'
 }
 
 Clear-Folder 'Crash dumps (user)'   @(Join-Path $Local 'CrashDumps')
 Clear-Folder 'Crash dumps (system)' @(Join-Path $env:WINDIR 'Minidump')
-Remove-Items 'Full memory dump'     @(Join-Path $env:WINDIR 'MEMORY.DMP')
+$memDump = Join-Path $env:WINDIR 'MEMORY.DMP'
+if (Test-Path -LiteralPath $memDump) { Remove-Items 'Full memory dump' @($memDump) }
 
 $recent = Join-Path $Roaming 'Microsoft\Windows\Recent'
 Clear-Folder 'Jump lists' @((Join-Path $recent 'AutomaticDestinations'), (Join-Path $recent 'CustomDestinations'))
@@ -414,12 +594,13 @@ if ($SameUser -and (Test-Tool 'conda')) { Clear-DevCache 'Conda packages and tar
 
 # NuGet: clear the download and temp caches. global-packages is kept so
 # projects do not need a full restore.
+$nugetHttp = First-Set $env:NUGET_HTTP_CACHE_PATH (Join-Path $Local 'NuGet\v3-cache')
 if ($SameUser -and (Test-Tool 'dotnet')) {
-    Clear-DevCache 'NuGet HTTP cache'    'dotnet' @('nuget', 'locals', 'http-cache', '--clear')    @()
+    Clear-DevCache 'NuGet HTTP cache'    'dotnet' @('nuget', 'locals', 'http-cache', '--clear')    @($nugetHttp)
     Clear-DevCache 'NuGet temp cache'    'dotnet' @('nuget', 'locals', 'temp', '--clear')          @()
-    Clear-DevCache 'NuGet plugins cache' 'dotnet' @('nuget', 'locals', 'plugins-cache', '--clear') @()
+    Clear-DevCache 'NuGet plugins cache' 'dotnet' @('nuget', 'locals', 'plugins-cache', '--clear') @(Join-Path $Local 'NuGet\plugins-cache')
 } else {
-    Clear-Folder 'NuGet HTTP cache' @((First-Set $env:NUGET_HTTP_CACHE_PATH (Join-Path $Local 'NuGet\v3-cache')), (Join-Path $Local 'NuGet\plugins-cache'))
+    Clear-Folder 'NuGet HTTP cache' @($nugetHttp, (Join-Path $Local 'NuGet\plugins-cache'))
 }
 
 $goCache = $null
@@ -453,19 +634,29 @@ Clear-Folder 'node-gyp headers cache'          @(Join-Path $Local 'node-gyp\Cach
 # ---------------------------------------------------------------------
 Write-Section 'Docker'
 # ---------------------------------------------------------------------
+# Only asked when the Docker engine is already running. If it is not
+# running there is nothing to prune, so the step is skipped.
 $DockerUp = $false
 if (Test-Tool 'docker') {
-    $DockerUp = Invoke-Timed 'docker' 'info' 20
-    if (-not $DockerUp) { Write-Step 'Docker engine is not running, skipping image cleanup' }
-    elseif ($DryRun) { Write-Step 'Would ask: remove unused Docker images and build cache?' }
-    elseif (Read-YesNo 'Remove unused Docker images and build cache? Containers and volumes are kept.' 60) {
-        Write-Step 'Removing unused images'; $null = Get-ToolOutput 'docker' @('image', 'prune', '--all', '--force')
-        Write-Step 'Removing build cache';   $null = Get-ToolOutput 'docker' @('builder', 'prune', '--all', '--force')
+    Start-Step 'Unused images and build cache'
+    $DockerUp = (Invoke-Timed 'docker' 'info' 20).Ok
+    if (-not $DockerUp) {
+        Write-Info 'engine not running'
+        End-Step 'skipped'
+    } elseif ($DryRun) {
+        Write-Info 'engine running, would ask y/N (60 s)  [dry run]'
+        End-Step 'dry run'
+    } elseif (Read-YesNo 'Remove unused Docker images and build cache? Containers and volumes are kept.' 60) {
+        $c1 = Invoke-Tool 'docker' @('image', 'prune', '--all', '--force')
+        $c2 = Invoke-Tool 'docker' @('builder', 'prune', '--all', '--force')
+        End-Step ('image prune exit {0} | builder prune exit {1}' -f $c1, $c2) $(if ($c1 -eq 0 -and $c2 -eq 0) { 'Green' } else { 'Yellow' })
+    } else {
+        End-Step 'skipped'
     }
-} else { Write-Step 'Docker is not installed' }
+}
 
 # ---------------------------------------------------------------------
-Write-Section 'Virtual disk compaction'
+Write-Section 'Virtual disks'
 # ---------------------------------------------------------------------
 # Disks are found, not assumed:
 #   - WSL distros from the user's Lxss registry key
@@ -482,8 +673,10 @@ function Add-Disk([string]$Path, [string]$Source) {
     $disks.Add([pscustomobject]@{ Path = $full; Source = $Source })
 }
 
+Start-Step 'Discover virtual disks'
 $wslDistros = @()
 $lxss = Join-Path $UserHive 'Software\Microsoft\Windows\CurrentVersion\Lxss'
+Write-Info 'scan  WSL registry (Lxss)'
 if (Test-Path $lxss) {
     Get-ChildItem $lxss -ErrorAction SilentlyContinue | ForEach-Object {
         $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
@@ -495,6 +688,7 @@ if (Test-Path $lxss) {
     }
 }
 
+Write-Info 'scan  Docker Desktop settings and data folders'
 $dockerDirs = @(Join-Path $Local 'Docker\wsl')
 foreach ($f in 'settings-store.json', 'settings.json') {
     $sf = Join-Path $Roaming (Join-Path 'Docker' $f)
@@ -515,22 +709,26 @@ foreach ($dir in ($dockerDirs | Select-Object -Unique)) {
 }
 
 if (Test-Tool 'Get-VM') {
+    Write-Info 'scan  Hyper-V virtual machines'
     try {
         Get-VM -ErrorAction Stop | ForEach-Object {
             $vm = $_
-            if ($vm.State -ne 'Off') { Write-Note "Hyper-V VM '$($vm.Name)' is running, its disks are skipped"; return }
-            if (@(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue).Count -gt 0) { Write-Note "Hyper-V VM '$($vm.Name)' has checkpoints, its disks are skipped"; return }
+            if ($vm.State -ne 'Off') { Write-Warn "Hyper-V VM '$($vm.Name)' is running, its disks are skipped"; return }
+            if (@(Get-VMSnapshot -VM $vm -ErrorAction SilentlyContinue).Count -gt 0) { Write-Warn "Hyper-V VM '$($vm.Name)' has checkpoints, its disks are skipped"; return }
             Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue | ForEach-Object { Add-Disk $_.Path "Hyper-V: $($vm.Name)" }
         }
-    } catch { }
+    } catch { Write-Warn 'Hyper-V is installed but could not be queried' }
 }
 
-if ($disks.Count -eq 0) {
-    Write-Step 'No virtual disks found'
-} elseif ($DryRun) {
-    foreach ($d in $disks) { Write-Step "$($d.Source): $($d.Path) ($(Format-Size (Get-Item -LiteralPath $d.Path).Length))" }
-    Write-Note 'would trim, shut down WSL and Docker, then compact each disk'
-} else {
+$diskTotal = 0
+foreach ($d in $disks) {
+    $len = (Get-Item -LiteralPath $d.Path).Length
+    $diskTotal += $len
+    Write-Detail ('found {0}  {1}  ({2})' -f $d.Source, (Short $d.Path), (Format-Size $len))
+}
+End-Step ('{0} disk(s), {1} on disk' -f $disks.Count, (Format-Size $diskTotal))
+
+if ($disks.Count -gt 0) {
     $haveWsl = ($wslDistros.Count -gt 0) -and (Test-Tool 'wsl')
 
     # 1. Trim: tell each Linux filesystem which blocks are free, so the
@@ -539,93 +737,129 @@ if ($disks.Count -eq 0) {
         foreach ($w in $wslDistros) {
             if (-not (Test-Path -LiteralPath $w.Vhd)) { continue }   # WSL 1 distro, no disk
             if ($w.Name -like 'docker-desktop*' -and -not $DockerUp) { continue }
-            Write-Step "Trimming free space in $($w.Name)"
-            if (-not (Invoke-Timed 'wsl.exe' "-d `"$($w.Name)`" -u root -e fstrim -av" 120)) { Write-Note 'could not trim (continuing)' }
+            Start-Step "Trim free space: $($w.Name)"
+            Write-Info "exec  wsl -d $($w.Name) -u root -e fstrim -av"
+            if ($DryRun) { End-Step 'dry run'; continue }
+            $r = Invoke-Timed 'wsl.exe' "-d `"$($w.Name)`" -u root -e fstrim -av" 180
+            foreach ($l in $r.Output) { Write-Detail "> $l" }
+            if ($r.Ok) { End-Step 'trimmed' } else { End-Step ("trim failed (exit {0}), compacting anyway" -f $r.ExitCode) 'Yellow' }
         }
     }
 
     # 2. Release the disks.
     $dockerProcs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -eq 'Docker Desktop' -or $_.ProcessName -like 'com.docker.*' })
-    if ($dockerProcs.Count -gt 0) { Write-Step 'Stopping Docker Desktop'; $dockerProcs | Stop-Process -Force -ErrorAction SilentlyContinue }
+    if ($dockerProcs.Count -gt 0) {
+        Start-Step 'Stop Docker Desktop'
+        foreach ($p in $dockerProcs) { Write-Detail ('kill  {0} (pid {1})' -f $p.ProcessName, $p.Id) }
+        if (-not $DryRun) { $dockerProcs | Stop-Process -Force -ErrorAction SilentlyContinue }
+        End-Step $(if ($DryRun) { 'dry run' } else { 'stopped' })
+    }
     if ($haveWsl) {
-        Write-Step 'Shutting down WSL'
-        $null = Invoke-Timed 'wsl.exe' '--shutdown' 60
-        $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-Process -Name 'vmmem', 'vmmemWSL' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
-        Start-Sleep -Seconds 2
+        Start-Step 'Shut down WSL'
+        Write-Info 'exec  wsl --shutdown'
+        if ($DryRun) { End-Step 'dry run' }
+        else {
+            $null = Invoke-Timed 'wsl.exe' '--shutdown' 60
+            $deadline = (Get-Date).AddSeconds(30)
+            while ((Get-Process -Name 'vmmem', 'vmmemWSL' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            Start-Sleep -Seconds 2
+            End-Step 'WSL is down'
+        }
     }
 
     # 3. Compact with diskpart, which ships with every Windows edition.
     $saved = 0
     foreach ($d in $disks) {
         $before = (Get-Item -LiteralPath $d.Path).Length
-        Write-Step "$($d.Source) ($(Format-Size $before))"
+        Start-Step "Compact $($d.Source)"
+        Write-Info "disk  $(Short $d.Path)"
+        Write-Info 'exec  diskpart: select vdisk / attach readonly / compact / detach'
+        if ($DryRun) { End-Step "$(Format-Size $before) now  [dry run]"; continue }
         $dp = [IO.Path]::GetTempFileName()
         $okCompact = $false
+        $out = @()
         try {
             Set-Content -LiteralPath $dp -Encoding Default -Value @("select vdisk file=`"$($d.Path)`"", 'attach vdisk readonly', 'compact vdisk')
-            $null = & diskpart.exe /s $dp
+            $out = @(& diskpart.exe /s $dp)
             $okCompact = ($LASTEXITCODE -eq 0)
         } finally {
             Set-Content -LiteralPath $dp -Encoding Default -Value @("select vdisk file=`"$($d.Path)`"", 'detach vdisk noerr')
             $null = & diskpart.exe /s $dp
             Remove-Item -LiteralPath $dp -Force -ErrorAction SilentlyContinue
         }
+        # Keep diskpart's result lines, drop its banner and progress noise.
+        $out | ForEach-Object { "$_".Trim() } |
+            Where-Object { $_ -and $_ -notmatch 'DiskPart version|Copyright|On computer|percent completed' } |
+            ForEach-Object { Write-Detail "> $_" }
         $after = (Get-Item -LiteralPath $d.Path).Length
         if ($okCompact) {
-            $saved += ($before - $after)
-            Write-Note "$(Format-Size $before) -> $(Format-Size $after)"
+            $freed = [Math]::Max(0, $before - $after)
+            $saved += $freed
+            End-Step ('{0} -> {1} | {2} freed' -f (Format-Size $before), (Format-Size $after), (Format-Size $freed))
         } else {
-            Write-Note 'could not compact (disk in use or not a dynamic disk)'
+            End-Step 'could not compact (disk in use or not a dynamic disk)' 'Yellow'
         }
     }
-    if ($saved -gt 0) { Write-Note "Compaction freed $(Format-Size $saved)" }
-    if ($dockerProcs.Count -gt 0) { Write-Note 'Docker Desktop was stopped. Start it again when you need it.' }
+    $script:TotalFreed += $saved
+    if ($dockerProcs.Count -gt 0 -and -not $DryRun) { Write-Host '[!] Docker Desktop was stopped. Start it again when you need it.' -ForegroundColor Yellow }
 }
 
 # ---------------------------------------------------------------------
 Write-Section 'System cleanup'
 # ---------------------------------------------------------------------
-Write-Step 'Recycle Bin'
-if ($DryRun) { Write-Note 'would empty' } else { Clear-RecycleBin -Force -ErrorAction SilentlyContinue; Write-Note 'emptied' }
+Start-Step 'Recycle Bin (all drives)'
+Write-Info 'exec  Clear-RecycleBin -Force'
+if ($DryRun) { End-Step 'dry run' } else { Clear-RecycleBin -Force -ErrorAction SilentlyContinue; End-Step 'emptied' }
 
-Write-Step 'Event logs'
+Start-Step 'Event logs'
 $logs = @(& wevtutil.exe el 2>$null)
-if ($DryRun) { Write-Note "would clear $($logs.Count) logs" }
+Write-Info "found $($logs.Count) logs"
+if ($DryRun) { End-Step 'dry run' }
 else {
-    $n = 0
-    foreach ($l in $logs) { & wevtutil.exe cl "$l" 2>$null; if ($LASTEXITCODE -eq 0) { $n++ } }
-    Write-Note "cleared $n of $($logs.Count)"
-}
-
-Write-Step 'DNS cache'
-if ($DryRun) { Write-Note 'would flush' } else { $null = & ipconfig.exe /flushdns; Write-Note 'flushed' }
-
-Write-Step 'Storage Sense'
-if ($DryRun) { Write-Note 'would trigger' }
-else {
-    try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; Write-Note 'triggered' }
-    catch { Write-Note 'not available on this system' }
-}
-
-Write-Step 'Windows component store (DISM, can take a few minutes)'
-if ($DryRun) { Write-Note 'would run DISM /StartComponentCleanup' }
-else { & dism.exe /online /Cleanup-Image /StartComponentCleanup /Quiet; Write-Note 'done' }
-
-# ---------------------------------------------------------------------
-#  Summary
-# ---------------------------------------------------------------------
-Write-Host ''
-Write-Host '================================================'
-if ($DryRun) {
-    Write-Host '  Dry run finished. Nothing was changed.'
-} else {
-    Write-Host '  Cleanup finished. Free space now:'
-    $FreeAfter = Get-FreeSpace
-    foreach ($k in ($FreeAfter.Keys | Sort-Object)) {
-        $diff = $FreeAfter[$k] - $FreeBefore[$k]
-        $gain = if ($diff -gt 0) { " (+$(Format-Size $diff))" } else { '' }
-        Write-Host "    $k $(Format-Size $FreeAfter[$k])$gain"
+    $n = 0; $failed = @()
+    foreach ($l in $logs) {
+        & wevtutil.exe cl "$l" 2>$null
+        if ($LASTEXITCODE -eq 0) { $n++ } else { $failed += $l }
     }
+    foreach ($f in $failed) { Write-Warn "kept  $f (protected)" }
+    End-Step "cleared $n of $($logs.Count)"
 }
-Write-Host '================================================'
+
+Start-Step 'DNS cache'
+Write-Info 'exec  ipconfig /flushdns'
+if ($DryRun) { End-Step 'dry run' } else { $null = & ipconfig.exe /flushdns; End-Step 'flushed' }
+
+Start-Step 'Storage Sense'
+Write-Info 'exec  scheduled task \Microsoft\Windows\DiskFootprint\StorageSense'
+if ($DryRun) { End-Step 'dry run' }
+else {
+    try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; End-Step 'triggered' }
+    catch { End-Step 'not available on this system' 'Yellow' }
+}
+
+Start-Step 'Windows component store (can take a few minutes)'
+Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup'
+if ($DryRun) { End-Step 'dry run' }
+else {
+    & dism.exe /online /Cleanup-Image /StartComponentCleanup /Quiet
+    End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
+}
+
+# ---------------------------------------------------------------------
+Write-Section 'Summary'
+# ---------------------------------------------------------------------
+$FreeAfter = Get-FreeSpace
+foreach ($k in $FreeAfter.Keys) {
+    $b = $FreeBefore[$k]; $a = $FreeAfter[$k]
+    $diff = $a - $b
+    $gain = if ($diff -gt 0) { "  (+$(Format-Size $diff))" } else { '' }
+    Write-Host ('[+] {0}  {1} -> {2} free{3}' -f $k, (Format-Size $b), (Format-Size $a), $gain) -ForegroundColor Green
+}
+Write-Host ('[+] measured by the steps above: {0}' -f (Format-Size $script:TotalFreed)) -ForegroundColor Green
+Write-Host ('[+] {0} steps in {1:mm\:ss}' -f $script:StepNo, $RunTimer.Elapsed) -ForegroundColor Green
+if ($DryRun) { Write-Host '[!] dry run finished, nothing was changed' -ForegroundColor Yellow }
+else { Write-Host '[+] done' -ForegroundColor Green }
+if ($LogFile) {
+    Write-Host ('[+] log saved: {0}' -f $LogFile) -ForegroundColor Green
+    try { Stop-Transcript | Out-Null } catch { }
+}

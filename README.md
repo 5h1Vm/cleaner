@@ -12,15 +12,9 @@ It works on any machine. Nothing in it points at one computer: every location is
 
 ![SmartScreen](https://github.com/5h1Vm/cleaner/assets/83861668/d1cf030f-bb68-4a11-a4e6-47736bac7234)
 
-From a terminal:
+At the start it asks whether to save a log file of the run. Press `y` to save one next to `cleaner.bat`. If you don't answer within 30 seconds, it carries on without a log.
 
-```
-cleaner.bat          clean everything
-cleaner.bat /dry     show what would be cleaned, change nothing
-cleaner.bat /?       help
-```
-
-Run `/dry` first if you want to see what it will touch on your machine.
+The output is verbose: every file and folder it removes is listed with its size, along with every command it runs, its output and exit code, and how long each step took. A summary at the end shows the free space gained on every drive.
 
 ## What it cleans
 
@@ -75,7 +69,7 @@ Run `/dry` first if you want to see what it will touch on your machine.
 | Electron, electron-builder, node-gyp | download caches |
 
 **Docker**
-- Asks whether to remove unused images and build cache. If nobody answers within 60 seconds, it skips. Containers and volumes are never touched.
+- If the Docker engine is running, it asks whether to remove unused images and build cache. If nobody answers within 60 seconds, it skips. If Docker isn't running, this step is skipped. Containers and volumes are never touched.
 
 **Virtual disk compaction**
 
