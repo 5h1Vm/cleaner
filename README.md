@@ -86,8 +86,9 @@ Docker Desktop is left stopped afterwards. Start it again when you need it.
 - Empties the Recycle Bin
 - Clears all event logs
 - Flushes the DNS cache
-- Triggers Storage Sense
-- Runs `DISM /StartComponentCleanup`
+- Turns on Storage Sense so Windows keeps cleaning between runs: temporary files on, Recycle Bin items deleted after 60 days (the longest option Windows offers). Downloads cleanup and the schedule are left as you set them. If your PC is managed and a policy controls Storage Sense, it is left alone.
+- Runs Storage Sense once
+- Runs `DISM /StartComponentCleanup /ResetBase` to remove old copies of updated Windows components
 
 ## Things to know
 
@@ -95,6 +96,8 @@ Docker Desktop is left stopped afterwards. Start it again when you need it.
 - Clearing event logs and Defender history removes the record of past errors and detections. Skip this tool if you are troubleshooting a problem or checking for malware.
 - Jump lists are cleared, including files pinned in taskbar right-click menus.
 - The Recycle Bin is emptied without asking.
+- After the DISM `/ResetBase` step, installed Windows updates can no longer be uninstalled.
+- Storage Sense settings are changed for your account and stay that way after the script ends. You can change them in Settings > System > Storage.
 - If you sign in to the admin prompt with a different account, the script still cleans your profile, not the admin's. Developer tool commands only run for your own account; for another account it removes their cache folders instead.
 
 ## How it works

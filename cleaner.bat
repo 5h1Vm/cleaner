@@ -880,14 +880,58 @@ Write-Info 'exec  ipconfig /flushdns'
 $null = & ipconfig.exe /flushdns
 End-Step 'flushed'
 
-Start-Step 'Storage Sense'
+# Storage Sense keeps cleaning between runs. It is turned on for the user
+# being cleaned (their own registry hive, found by SID), with:
+#   - temporary files cleanup on
+#   - Recycle Bin cleanup after 60 days, the longest option Windows offers
+#     (Settings > System > Storage > Storage Sense lists 1, 14, 30, 60 days)
+# Downloads cleanup and the run schedule are left as the user set them.
+# The value names below are Windows' own Storage Sense settings.
+Start-Step 'Storage Sense settings'
+$ssPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\StorageSense'
+$ssPolicy    = Get-ItemProperty -Path $ssPolicyKey -ErrorAction SilentlyContinue
+$ssKey       = Join-Path $UserHive 'Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy'
+if ($ssPolicy -and $null -ne $ssPolicy.AllowStorageSenseGlobal -and $ssPolicy.AllowStorageSenseGlobal -eq 0) {
+    Write-Warn 'Storage Sense is turned off by a system policy (managed PC), leaving it alone'
+    End-Step 'skipped' 'Yellow'
+} else {
+    if (-not (Test-Path $ssKey)) { $null = New-Item -Path $ssKey -ErrorAction SilentlyContinue }
+    $current = Get-ItemProperty -Path $ssKey -ErrorAction SilentlyContinue
+    $wanted = [ordered]@{
+        '01'  = @{ Value = 1;  Label = 'Storage Sense' }
+        '04'  = @{ Value = 1;  Label = 'delete temporary files' }
+        '08'  = @{ Value = 1;  Label = 'Recycle Bin cleanup' }
+        '256' = @{ Value = 60; Label = 'Recycle Bin age (days)' }
+    }
+    $changed = 0
+    foreach ($name in $wanted.Keys) {
+        $old = $current.$name
+        $new = $wanted[$name].Value
+        try {
+            Set-ItemProperty -Path $ssKey -Name $name -Value $new -Type DWord -ErrorAction Stop
+            $oldText = if ($null -eq $old) { 'unset' } else { $old }
+            if ("$old" -ne "$new") { $changed++ }
+            Write-Info ('{0,-24} {1} -> {2}' -f $wanted[$name].Label, $oldText, $new)
+        } catch { Write-Warn "could not set $($wanted[$name].Label): $($_.Exception.Message)" }
+    }
+    if ($ssPolicy -and $null -ne $ssPolicy.ConfigStorageSenseRecycleBinCleanupThreshold) {
+        Write-Warn ('a system policy sets the Recycle Bin age to {0} days and overrides this' -f $ssPolicy.ConfigStorageSenseRecycleBinCleanupThreshold)
+    }
+    End-Step ('on | {0} setting(s) changed' -f $changed)
+}
+
+Start-Step 'Run Storage Sense now'
 Write-Info 'exec  scheduled task \Microsoft\Windows\DiskFootprint\StorageSense'
 try { Start-ScheduledTask -TaskPath '\Microsoft\Windows\DiskFootprint\' -TaskName 'StorageSense' -ErrorAction Stop; End-Step 'triggered' }
 catch { End-Step 'not available on this system' 'Yellow' }
 
-Start-Step 'Windows component store (can take a few minutes)'
-Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup'
-& dism.exe /online /Cleanup-Image /StartComponentCleanup /Quiet
+# /ResetBase removes the old copies of updated Windows components. It frees
+# more space than a plain cleanup, but installed updates can no longer be
+# uninstalled afterwards.
+Start-Step 'Windows component store (can take several minutes)'
+Write-Info 'exec  dism /online /Cleanup-Image /StartComponentCleanup /ResetBase'
+Write-Info 'after this, installed Windows updates can no longer be uninstalled'
+& dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase /Quiet
 End-Step ("exit {0}" -f $LASTEXITCODE) $(if ($LASTEXITCODE -eq 0) { 'Green' } else { 'Yellow' })
 
 # ---------------------------------------------------------------------
